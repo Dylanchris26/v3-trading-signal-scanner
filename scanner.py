@@ -1014,7 +1014,8 @@ def main() -> None:
 
     try:
         iq = connect_iq()
-telegram_send("✅ TEST: IQ Option scanner connected successfully.")
+        telegram_send("✅ TEST: IQ Option scanner connected successfully.")
+
         # One run produces at most one new signal. If scheduled frequently,
         # every run re-evaluates the strongest currently qualifying setup.
         signal = select_best_signal(iq, state)
