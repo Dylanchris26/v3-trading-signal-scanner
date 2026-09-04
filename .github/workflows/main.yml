@@ -3,12 +3,12 @@ name: V4 Trading Signal Scanner
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "0 */6 * * *"
 
 jobs:
   scanner:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 330
 
     steps:
       - name: Checkout repository
@@ -31,6 +31,6 @@ jobs:
           IQ_PASSWORD: ${{ secrets.IQ_PASSWORD }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-        run:  |
-          echo "STARTING SCANNER..."
+        run: |
+          echo "STARTING V4 SCANNER..."
           python -u scanner.py
