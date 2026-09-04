@@ -1,3 +1,4 @@
+print("STEP 1: Python started", flush=True)
 import os
 import time
 import json
