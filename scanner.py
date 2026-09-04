@@ -1,11 +1,25 @@
 print("STEP 1: Python started", flush=True)
+
 import os
+print("STEP 2: os loaded", flush=True)
+
 import time
+print("STEP 3: time loaded", flush=True)
+
 import json
+print("STEP 4: json loaded", flush=True)
+
 import logging
+print("STEP 5: logging loaded", flush=True)
+
 import requests
+print("STEP 6: requests loaded", flush=True)
+
 import pandas as pd
+print("STEP 7: pandas loaded", flush=True)
+
 import numpy as np
+print("STEP 8: numpy loaded", flush=True)
 
 from datetime import datetime, timedelta, timezone
 from iqoptionapi.stable_api import IQ_Option
