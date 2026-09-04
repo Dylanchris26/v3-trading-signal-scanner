@@ -321,7 +321,7 @@ def market_status(iq: IQ_Option, regular_pair: str) -> Tuple[Optional[str], Opti
     This intentionally does not infer market-open state from candle freshness.
     """
     try:
-        raw = {}
+        raw = iq.get_all_open_time()
     except Exception as exc:
         LOGGER.warning("Open-time status request failed: %s", exc)
         return None, None
