@@ -918,11 +918,123 @@ def main():
             if state["date"] != current_day():
                 state = load_state()
 
-            if (
-                state["signals_today"]
-                >= MAX_SIGNALS_PER_DAY
-            ):
+            if state["signals_today"] >= MAX_SIGNALS_PER_DAY:
+
                 print(
                     "Daily limit reached.",
                     flush=True
-      
+                )
+
+                time.sleep(300)
+                continue
+
+            candidates = []
+
+            for pair in PAIRS:
+
+                result = analyze_pair(
+                    iq,
+                    pair
+                )
+
+                if result:
+                    candidates.append(result)
+
+            if candidates:
+
+                candidates.sort(
+                    key=lambda x: (
+                        x["confidence"],
+                        x["score"],
+                        x["separation"],
+                    ),
+                    reverse=True
+                )
+
+                best = candidates[0]
+
+                last = state["last_signals"].get(
+                    best["pair"]
+                )
+
+                if (
+                    last
+                    and last["direction"]
+                    == best["direction"]
+                ):
+
+                    print(
+                        f"{best['pair']}: duplicate ignored",
+                        flush=True
+                    )
+
+                else:
+
+                    message = format_signal(best)
+
+                    if telegram(message):
+
+                        state["signals_today"] += 1
+
+                        state["last_signals"][
+                            best["pair"]
+                        ] = {
+                            "direction": best["direction"],
+                            "time": datetime.now(
+                                timezone.utc
+                            ).isoformat(),
+                        }
+
+                        state["history"].append(best)
+
+                        save_state(state)
+
+                        print(
+                            "✅ SIGNAL SENT:",
+                            best["pair"],
+                            best["direction"],
+                            f"{best['confidence']}%",
+                            flush=True
+                        )
+
+            else:
+
+                print(
+                    "No qualifying setup.",
+                    flush=True
+                )
+
+            time.sleep(SCAN_INTERVAL)
+
+        except KeyboardInterrupt:
+
+            print(
+                "Scanner stopped.",
+                flush=True
+            )
+
+            break
+
+        except Exception as e:
+
+            print(
+                f"⚠️ Scanner error: {e}",
+                flush=True
+            )
+
+            traceback.print_exc()
+
+            telegram(
+                "⚠️ V4.1 SCANNER WARNING\n\n"
+                f"{str(e)[:500]}"
+            )
+
+            time.sleep(30)
+
+
+# ============================================================
+# START
+# ============================================================
+
+if __name__ == "__main__":
+    main()
