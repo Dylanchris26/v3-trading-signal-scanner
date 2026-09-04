@@ -310,52 +310,38 @@ def _details_confirm_open(details: Optional[Dict[str, Any]]) -> bool:
 
 def market_status(iq: IQ_Option, regular_pair: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Returns (actual_symbol, market_type).
+    Lightweight market check.
 
-    Priority:
-      1. Regular pair only if IQ Option explicitly says it is open.
-      2. OTC pair only if regular is unavailable AND the OTC symbol is
-         explicitly reported open.
-      3. Otherwise (None, None).
-
-    This intentionally does not infer market-open state from candle freshness.
+    We do NOT use get_all_open_time() because that endpoint can hang.
+    Instead, we test whether recent candles can be retrieved.
     """
-    try:
-        raw = iq.get_all_open_time()
-    except Exception as exc:
-        LOGGER.warning("Open-time status request failed: %s", exc)
-        return None, None
-
-    catalog = _normalise_open_time_catalog(raw)
     regular = regular_pair.upper()
 
-    # Explicit regular symbol.
-    if _details_confirm_open(catalog.get(regular)):
-        return regular, "REGULAR"
-
-    # Some API versions expose instruments with an ".op" suffix.
-    otc_candidates = [
-        f"{regular}-OTC",
-        f"{regular}OTC",
-        f"{regular}.OTC",
-        f"{regular}.op",
-        f"{regular}_OTC",
+    candidates = [
+        (regular, "REGULAR"),
+        (f"{regular}-OTC", "OTC"),
+        (f"{regular}OTC", "OTC"),
+        (f"{regular}.OTC", "OTC"),
+        (f"{regular}_OTC", "OTC"),
     ]
 
-    for candidate in otc_candidates:
-        details = catalog.get(candidate.upper())
-        if _details_confirm_open(details):
-            return candidate.upper(), "OTC"
+    end_time = int(time.time())
 
-    # Last-resort discovery: only an explicitly open key containing both the
-    # base pair and an OTC marker qualifies.
-    for symbol, details in catalog.items():
-        upper = symbol.upper()
-        if regular in upper and "OTC" in upper and _details_confirm_open(details):
-            return symbol, "OTC"
+    for symbol, market_type in candidates:
+        try:
+            candles = iq.get_candles(symbol, 60, 3, end_time)
+
+            if candles and len(candles) >= 2:
+                return symbol, market_type
+
+        except Exception as exc:
+            LOGGER.debug(
+                "Market check failed for %s: %s",
+                symbol,
+                exc,
+            )
 
     return None, None
-
 
 def get_candles(iq: IQ_Option, symbol: str, timeframe: str, count: int) -> List[Candle]:
     seconds = TIMEFRAMES[timeframe]
