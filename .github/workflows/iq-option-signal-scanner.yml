@@ -165,4 +165,4 @@ jobs:
           PY
 
       - name: Run signal scanner
-        run: python scanner.py
+        run: timeout 90s python scanner.py
