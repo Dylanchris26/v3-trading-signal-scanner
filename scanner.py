@@ -1,11 +1,41 @@
 import os
 import time
+import json
 import logging
 import requests
 import pandas as pd
 import numpy as np
 
+from datetime import datetime, timedelta, timezone
 from iqoptionapi.stable_api import IQ_Option
+
+
+# ============================================================
+# V4 — PROFESSIONAL-STYLE LIVE SIGNAL SCANNER
+# ============================================================
+#
+# PURPOSE
+# -------
+# Practice/demo market scanner for IQ Option.
+#
+# Main objectives:
+#   • High-quality signals only
+#   • Maximum 4 signals per day
+#   • Rank pairs instead of blindly signalling every pair
+#   • Multi-timeframe confirmation
+#   • Adaptive expiry
+#   • Duplicate protection
+#   • Signal cooldown
+#   • Daily/monthly progress tracking
+#   • Telegram alerts
+#   • Automatic trading OFF
+#
+# IMPORTANT
+# ---------
+# The $10 -> $100 objective is a TARGET ONLY.
+# It is NOT a guaranteed return and is never used to force trades.
+#
+# ============================================================
 
 
 # ============================================================
@@ -19,18 +49,44 @@ PAIRS = [
     "EURJPY",
 ]
 
+# History
 CANDLE_COUNT = 400
 
-EXPIRY_MINUTES = 5
+# Scanner frequency
+SCAN_INTERVAL_SECONDS = 60
 
-MIN_SCORE = 8
+# Maximum number of signals allowed in one UTC/local bot day
+MAX_SIGNALS_PER_DAY = 4
+
+# Minimum time between signals from the same pair
+PAIR_COOLDOWN_MINUTES = 20
+
+# Minimum time between ANY signals
+GLOBAL_COOLDOWN_MINUTES = 5
+
+# Signal quality
+MIN_SCORE = 9
 MIN_SEPARATION = 3
 
+# Minimum confidence
+MIN_CONFIDENCE = 72
+
+# Monthly tracking target
+STARTING_TARGET = 10.0
+MONTHLY_TARGET = 100.0
+
+# Demo/practice only
 ACCOUNT_MODE = "PRACTICE"
+
+# Never automatically place trades
+AUTO_TRADE = False
+
+# Persistent local state
+STATE_FILE = "v4_state.json"
 
 
 # ============================================================
-# QUIET IQ OPTION LOGGING
+# LOGGING
 # ============================================================
 
 logging.getLogger().setLevel(logging.WARNING)
@@ -48,7 +104,6 @@ IQ_PASSWORD = os.environ.get("IQ_PASSWORD")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-
 required = {
     "IQ_EMAIL": IQ_EMAIL,
     "IQ_PASSWORD": IQ_PASSWORD,
@@ -56,12 +111,175 @@ required = {
     "CHAT_ID": CHAT_ID,
 }
 
-missing = [name for name, value in required.items() if not value]
+missing = [
+    name
+    for name, value in required.items()
+    if not value
+]
 
 if missing:
     raise RuntimeError(
-        "Missing GitHub Secrets: " + ", ".join(missing)
+        "Missing GitHub Secrets: " +
+        ", ".join(missing)
     )
+
+
+# ============================================================
+# GLOBAL IQ OPTION OBJECT
+# ============================================================
+
+Iq = None
+
+
+# ============================================================
+# TIME HELPERS
+# ============================================================
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def now_string():
+    return now_utc().strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+
+
+def month_key():
+    return now_utc().strftime("%Y-%m")
+
+
+def day_key():
+    return now_utc().strftime("%Y-%m-%d")
+
+
+# ============================================================
+# STATE MANAGEMENT
+# ============================================================
+
+def default_state():
+
+    return {
+        "month": month_key(),
+        "day": day_key(),
+
+        "signals_today": 0,
+
+        "starting_balance": STARTING_TARGET,
+
+        "tracked_balance": STARTING_TARGET,
+
+        "wins": 0,
+        "losses": 0,
+
+        "signals_total": 0,
+
+        "last_signal_time": None,
+
+        "last_signal_by_pair": {},
+
+        "signal_history": [],
+    }
+
+
+def load_state():
+
+    if not os.path.exists(STATE_FILE):
+        return default_state()
+
+    try:
+
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            state = json.load(file)
+
+    except Exception as e:
+
+        print(
+            "⚠️ State file could not be read:",
+            e
+        )
+
+        return default_state()
+
+    defaults = default_state()
+
+    for key, value in defaults.items():
+
+        if key not in state:
+            state[key] = value
+
+    # New month
+    if state.get("month") != month_key():
+
+        state = default_state()
+
+    # New day
+    elif state.get("day") != day_key():
+
+        state["day"] = day_key()
+        state["signals_today"] = 0
+
+    return state
+
+
+def save_state(state):
+
+    try:
+
+        with open(
+            STATE_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            json.dump(
+                state,
+                file,
+                indent=4,
+                default=str
+            )
+
+    except Exception as e:
+
+        print(
+            "⚠️ Could not save state:",
+            e
+        )
+
+
+STATE = load_state()
+
+
+# ============================================================
+# RESET DAILY STATE
+# ============================================================
+
+def refresh_day_state():
+
+    global STATE
+
+    current_day = day_key()
+    current_month = month_key()
+
+    if STATE.get("month") != current_month:
+
+        STATE = default_state()
+
+        save_state(STATE)
+
+        return
+
+    if STATE.get("day") != current_day:
+
+        STATE["day"] = current_day
+        STATE["signals_today"] = 0
+
+        save_state(STATE)
 
 
 # ============================================================
@@ -69,28 +287,66 @@ if missing:
 # ============================================================
 
 def send_telegram(message):
+
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+        url = (
+            f"https://api.telegram.org/"
+            f"bot{BOT_TOKEN}/sendMessage"
+        )
 
         response = requests.post(
             url,
             data={
                 "chat_id": CHAT_ID,
                 "text": message,
+                "disable_web_page_preview": True,
             },
             timeout=15,
         )
 
         if response.status_code == 200:
-            print("📨 Telegram alert sent")
+
+            print(
+                "📨 Telegram alert sent"
+            )
+
             return True
 
-        print("❌ Telegram error:", response.text)
+        print(
+            "❌ Telegram error:",
+            response.text
+        )
+
         return False
 
     except Exception as e:
-        print("❌ Telegram exception:", e)
+
+        print(
+            "❌ Telegram exception:",
+            e
+        )
+
         return False
+
+
+# ============================================================
+# SAFE FLOAT
+# ============================================================
+
+def safe_float(value):
+
+    try:
+
+        result = float(value)
+
+        if np.isfinite(result):
+            return result
+
+    except Exception:
+        pass
+
+    return None
 
 
 # ============================================================
@@ -101,73 +357,113 @@ def add_indicators(df):
 
     df = df.copy()
 
+    # --------------------------------------------------------
     # EMA
-    df["ema9"] = df["close"].ewm(
-        span=9,
-        adjust=False
-    ).mean()
+    # --------------------------------------------------------
 
-    df["ema21"] = df["close"].ewm(
-        span=21,
-        adjust=False
-    ).mean()
+    df["ema9"] = (
+        df["close"]
+        .ewm(span=9, adjust=False)
+        .mean()
+    )
 
-    df["ema20"] = df["close"].ewm(
-        span=20,
-        adjust=False
-    ).mean()
+    df["ema21"] = (
+        df["close"]
+        .ewm(span=21, adjust=False)
+        .mean()
+    )
 
-    df["ema50"] = df["close"].ewm(
-        span=50,
-        adjust=False
-    ).mean()
+    df["ema20"] = (
+        df["close"]
+        .ewm(span=20, adjust=False)
+        .mean()
+    )
 
+    df["ema50"] = (
+        df["close"]
+        .ewm(span=50, adjust=False)
+        .mean()
+    )
+
+    df["ema100"] = (
+        df["close"]
+        .ewm(span=100, adjust=False)
+        .mean()
+    )
+
+    # --------------------------------------------------------
     # MACD
-    ema12 = df["close"].ewm(
-        span=12,
-        adjust=False
-    ).mean()
+    # --------------------------------------------------------
 
-    ema26 = df["close"].ewm(
-        span=26,
-        adjust=False
-    ).mean()
+    ema12 = (
+        df["close"]
+        .ewm(span=12, adjust=False)
+        .mean()
+    )
+
+    ema26 = (
+        df["close"]
+        .ewm(span=26, adjust=False)
+        .mean()
+    )
 
     df["macd"] = ema12 - ema26
 
-    df["macd_signal"] = df["macd"].ewm(
-        span=9,
-        adjust=False
-    ).mean()
+    df["macd_signal"] = (
+        df["macd"]
+        .ewm(span=9, adjust=False)
+        .mean()
+    )
 
     df["macd_hist"] = (
         df["macd"] -
         df["macd_signal"]
     )
 
+    # --------------------------------------------------------
     # RSI
+    # --------------------------------------------------------
+
     delta = df["close"].diff()
 
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(
-        alpha=1 / 14,
-        adjust=False
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / 14,
-        adjust=False
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-
-    df["rsi"] = 100 - (
-        100 / (1 + rs)
+    avg_gain = (
+        gain
+        .ewm(
+            alpha=1 / 14,
+            adjust=False
+        )
+        .mean()
     )
 
+    avg_loss = (
+        loss
+        .ewm(
+            alpha=1 / 14,
+            adjust=False
+        )
+        .mean()
+    )
+
+    rs = (
+        avg_gain /
+        avg_loss.replace(0, np.nan)
+    )
+
+    df["rsi"] = (
+        100 -
+        (
+            100 /
+            (1 + rs)
+        )
+    )
+
+    # --------------------------------------------------------
     # Candle structure
+    # --------------------------------------------------------
+
     df["range"] = (
         df["high"] -
         df["low"]
@@ -180,13 +476,32 @@ def add_indicators(df):
 
     df["body_ratio"] = (
         df["body"] /
-        df["range"].replace(0, np.nan)
+        df["range"].replace(
+            0,
+            np.nan
+        )
     )
 
+    df["upper_wick"] = (
+        df["high"] -
+        df[["open", "close"]].max(axis=1)
+    )
+
+    df["lower_wick"] = (
+        df[["open", "close"]].min(axis=1) -
+        df["low"]
+    )
+
+    # --------------------------------------------------------
     # ATR
+    # --------------------------------------------------------
+
     previous_close = df["close"].shift(1)
 
-    tr1 = df["high"] - df["low"]
+    tr1 = (
+        df["high"] -
+        df["low"]
+    )
 
     tr2 = (
         df["high"] -
@@ -203,9 +518,26 @@ def add_indicators(df):
         axis=1
     ).max(axis=1)
 
-    df["atr"] = true_range.rolling(14).mean()
+    df["atr"] = (
+        true_range
+        .rolling(14)
+        .mean()
+    )
 
-    # Recent support / resistance
+    # --------------------------------------------------------
+    # ATR average
+    # --------------------------------------------------------
+
+    df["atr_mean"] = (
+        df["atr"]
+        .rolling(30)
+        .mean()
+    )
+
+    # --------------------------------------------------------
+    # Recent support/resistance
+    # --------------------------------------------------------
+
     df["recent_high"] = (
         df["high"]
         .rolling(20)
@@ -218,6 +550,29 @@ def add_indicators(df):
         .rolling(20)
         .min()
         .shift(1)
+    )
+
+    # --------------------------------------------------------
+    # Short-term price momentum
+    # --------------------------------------------------------
+
+    df["momentum_3"] = (
+        df["close"] -
+        df["close"].shift(3)
+    )
+
+    df["momentum_5"] = (
+        df["close"] -
+        df["close"].shift(5)
+    )
+
+    # --------------------------------------------------------
+    # EMA slope
+    # --------------------------------------------------------
+
+    df["ema21_slope"] = (
+        df["ema21"] -
+        df["ema21"].shift(3)
     )
 
     return df
@@ -237,13 +592,14 @@ def get_market_data(pair):
     )
 
     if not candles:
+
         raise RuntimeError(
             f"No candle data for {pair}"
         )
 
     df = pd.DataFrame(candles)
 
-    # IQ Option normally uses:
+    # IQ Option API normally uses:
     # max = high
     # min = low
 
@@ -253,9 +609,6 @@ def get_market_data(pair):
     if "min" in df.columns:
         df["low"] = df["min"]
 
-    # Some API versions may already provide
-    # high / low.
-
     required_columns = [
         "open",
         "close",
@@ -264,25 +617,34 @@ def get_market_data(pair):
     ]
 
     for col in required_columns:
+
         if col not in df.columns:
+
             raise RuntimeError(
-                f"{pair}: missing candle field '{col}'"
+                f"{pair}: missing candle field "
+                f"'{col}'"
             )
 
     # Timestamp
+
     if "from" in df.columns:
+
         df["timestamp"] = pd.to_datetime(
             df["from"],
-            unit="s"
+            unit="s",
+            utc=True
         )
 
     elif "at" in df.columns:
+
         df["timestamp"] = pd.to_datetime(
             df["at"],
-            unit="s"
+            unit="s",
+            utc=True
         )
 
     else:
+
         raise RuntimeError(
             f"{pair}: no candle timestamp"
         )
@@ -300,12 +662,14 @@ def get_market_data(pair):
     )
 
     # Numeric conversion
+
     for col in [
         "open",
         "close",
         "high",
         "low",
     ]:
+
         df[col] = pd.to_numeric(
             df[col],
             errors="coerce"
@@ -320,51 +684,375 @@ def get_market_data(pair):
         ]
     )
 
-    # Remove currently-forming 1-minute candle
-    current_minute = pd.Timestamp.now().floor("min")
+    # Remove currently-forming 1m candle
+
+    current_minute = (
+        pd.Timestamp.now(
+            tz="UTC"
+        ).floor("min")
+    )
 
     df = df[
-        df.index < current_minute
+        df.index <
+        current_minute
     ]
 
-    if len(df) < 100:
+    if len(df) < 150:
+
         raise RuntimeError(
-            f"{pair}: insufficient completed 1m candles"
+            f"{pair}: insufficient completed "
+            f"1m candles"
         )
 
     return df
 
 
 # ============================================================
-# BUILD 5-MINUTE DATA
+# BUILD HIGHER TIMEFRAMES
 # ============================================================
 
-def make_5m_data(df):
+def make_resampled_data(
+    df,
+    timeframe
+):
 
-    five = df[
+    result = df[
         [
             "open",
             "high",
             "low",
             "close",
         ]
-    ].resample("5min").agg({
+    ].resample(timeframe).agg({
         "open": "first",
         "high": "max",
         "low": "min",
         "close": "last",
     })
 
-    # Remove incomplete current 5-minute candle
-    current_5m = pd.Timestamp.now().floor("5min")
+    if timeframe == "5min":
 
-    five = five[
-        five.index < current_5m
-    ]
+        current_period = (
+            pd.Timestamp.now(
+                tz="UTC"
+            ).floor("5min")
+        )
 
-    five = five.dropna()
+    elif timeframe == "15min":
 
-    return five
+        current_period = (
+            pd.Timestamp.now(
+                tz="UTC"
+            ).floor("15min")
+        )
+
+    else:
+
+        current_period = None
+
+    if current_period is not None:
+
+        result = result[
+            result.index <
+            current_period
+        ]
+
+    result = result.dropna()
+
+    return result
+
+
+# ============================================================
+# MARKET REGIME
+# ============================================================
+
+def determine_regime(five):
+
+    latest = five.iloc[-1]
+
+    ema20 = safe_float(
+        latest["ema20"]
+    )
+
+    ema50 = safe_float(
+        latest["ema50"]
+    )
+
+    ema100 = safe_float(
+        latest["ema100"]
+    )
+
+    if None in [
+        ema20,
+        ema50,
+        ema100,
+    ]:
+
+        return "UNKNOWN"
+
+    if (
+        ema20 > ema50
+        and
+        ema50 > ema100
+    ):
+
+        return "STRONG_UPTREND"
+
+    if (
+        ema20 < ema50
+        and
+        ema50 < ema100
+    ):
+
+        return "STRONG_DOWNTREND"
+
+    if ema20 > ema50:
+
+        return "UPTREND"
+
+    if ema20 < ema50:
+
+        return "DOWNTREND"
+
+    return "RANGE"
+
+
+# ============================================================
+# ADAPTIVE EXPIRY
+# ============================================================
+
+def determine_expiry(
+    signal,
+    one,
+    five,
+    fifteen
+):
+
+    latest_1 = one.iloc[-1]
+    latest_5 = five.iloc[-1]
+    latest_15 = fifteen.iloc[-1]
+
+    atr = safe_float(
+        latest_1["atr"]
+    )
+
+    atr_mean = safe_float(
+        latest_1["atr_mean"]
+    )
+
+    body_ratio = safe_float(
+        latest_1["body_ratio"]
+    )
+
+    if any(
+        value is None
+        for value in [
+            atr,
+            atr_mean,
+            body_ratio,
+        ]
+    ):
+
+        return 5
+
+    regime_15 = determine_regime(
+        fifteen
+    )
+
+    regime_5 = determine_regime(
+        five
+    )
+
+    volatility_ratio = (
+        atr / atr_mean
+        if atr_mean > 0
+        else 1
+    )
+
+    # Strong alignment + healthy momentum
+    if (
+        regime_15 in [
+            "STRONG_UPTREND",
+            "STRONG_DOWNTREND",
+        ]
+        and
+        regime_5 in [
+            "STRONG_UPTREND",
+            "STRONG_DOWNTREND",
+        ]
+        and
+        body_ratio >= 0.60
+        and
+        0.80 <= volatility_ratio <= 1.80
+    ):
+
+        return 5
+
+    # Very short-term strong continuation
+    if (
+        body_ratio >= 0.70
+        and
+        volatility_ratio >= 1.10
+    ):
+
+        return 3
+
+    # Slower / weaker environment
+    if (
+        body_ratio < 0.55
+        or
+        volatility_ratio < 0.75
+    ):
+
+        return 5
+
+    return 5
+
+
+# ============================================================
+# SIGNAL CONFIDENCE
+# ============================================================
+
+def calculate_confidence(
+    score,
+    opposing_score,
+    confirmations
+):
+
+    # Base confidence
+    confidence = 50
+
+    score_bonus = min(
+        max(score - MIN_SCORE, 0) * 3,
+        12
+    )
+
+    separation_bonus = min(
+        max(
+            score -
+            opposing_score -
+            MIN_SEPARATION,
+            0
+        ) * 3,
+        12
+    )
+
+    confirmation_bonus = min(
+        confirmations * 4,
+        20
+    )
+
+    confidence += (
+        score_bonus +
+        separation_bonus +
+        confirmation_bonus
+    )
+
+    return int(
+        min(confidence, 98)
+    )
+
+
+# ============================================================
+# SIGNAL ELIGIBILITY
+# ============================================================
+
+def pair_is_on_cooldown(pair):
+
+    last_times = STATE.get(
+        "last_signal_by_pair",
+        {}
+    )
+
+    value = last_times.get(pair)
+
+    if not value:
+        return False
+
+    try:
+
+        last_time = datetime.fromisoformat(
+            value
+        )
+
+        elapsed = (
+            now_utc() -
+            last_time
+        ).total_seconds() / 60
+
+        return (
+            elapsed <
+            PAIR_COOLDOWN_MINUTES
+        )
+
+    except Exception:
+
+        return False
+
+
+def global_is_on_cooldown():
+
+    value = STATE.get(
+        "last_signal_time"
+    )
+
+    if not value:
+        return False
+
+    try:
+
+        last_time = datetime.fromisoformat(
+            value
+        )
+
+        elapsed = (
+            now_utc() -
+            last_time
+        ).total_seconds() / 60
+
+        return (
+            elapsed <
+            GLOBAL_COOLDOWN_MINUTES
+        )
+
+    except Exception:
+
+        return False
+
+
+# ============================================================
+# DUPLICATE PROTECTION
+# ============================================================
+
+def signal_already_sent(
+    pair,
+    signal,
+    timestamp
+):
+
+    history = STATE.get(
+        "signal_history",
+        []
+    )
+
+    timestamp_text = str(
+        timestamp
+    )
+
+    for item in history:
+
+        if (
+            item.get("pair") == pair
+            and
+            item.get("signal") == signal
+            and
+            item.get("timestamp") ==
+            timestamp_text
+        ):
+
+            return True
+
+    return False
 
 
 # ============================================================
@@ -373,14 +1061,32 @@ def make_5m_data(df):
 
 def analyze_pair(pair):
 
-    one_min = get_market_data(pair)
+    one_min = get_market_data(
+        pair
+    )
 
-    five_min = make_5m_data(one_min)
+    five_min = make_resampled_data(
+        one_min,
+        "5min"
+    )
 
-    if len(five_min) < 60:
+    fifteen_min = make_resampled_data(
+        one_min,
+        "15min"
+    )
+
+    if len(five_min) < 100:
+
         return {
             "status": "WAIT",
             "reason": "Not enough 5m candles",
+        }
+
+    if len(fifteen_min) < 60:
+
+        return {
+            "status": "WAIT",
+            "reason": "Not enough 15m candles",
         }
 
     one = add_indicators(
@@ -391,473 +1097,14 @@ def analyze_pair(pair):
         five_min
     )
 
+    fifteen = add_indicators(
+        fifteen_min
+    )
+
     latest_1 = one.iloc[-1]
     latest_5 = five.iloc[-1]
+    latest_15 = fifteen.iloc[-1]
 
     # --------------------------------------------------------
-    # VALUES
-    # --------------------------------------------------------
-
-    rsi = float(latest_1["rsi"])
-
-    price = float(latest_1["close"])
-
-    body_ratio = float(
-        latest_1["body_ratio"]
-    )
-
-    atr = float(
-        latest_1["atr"]
-    )
-
-    candle_range = float(
-        latest_1["range"]
-    )
-
-    # Safety against invalid calculations
-    if any(
-        pd.isna(x)
-        for x in [
-            rsi,
-            price,
-            body_ratio,
-            atr,
-            candle_range,
-        ]
-    ):
-        return {
-            "status": "WAIT",
-            "reason": "Indicators not ready",
-        }
-
-    # --------------------------------------------------------
-    # VOLATILITY FILTER
-    # --------------------------------------------------------
-
-    if atr <= 0:
-        return {
-            "status": "WAIT",
-            "reason": "Invalid ATR",
-        }
-
-    if candle_range < (
-        0.50 * atr
-    ):
-        return {
-            "status": "WAIT",
-            "reason": "Weak volatility",
-            "call": 0,
-            "put": 0,
-            "rsi": rsi,
-        }
-
-    # --------------------------------------------------------
-    # CANDLE STRENGTH
-    # --------------------------------------------------------
-
-    if body_ratio < 0.45:
-        return {
-            "status": "WAIT",
-            "reason": "Weak candle",
-            "call": 0,
-            "put": 0,
-            "rsi": rsi,
-        }
-
-    # --------------------------------------------------------
-    # SCORES
-    # --------------------------------------------------------
-
-    call_score = 0
-    put_score = 0
-
-    reasons_call = []
-    reasons_put = []
-
-    # ========================================================
-    # 5-MINUTE TREND
-    # ========================================================
-
-    if (
-        latest_5["ema20"] >
-        latest_5["ema50"]
-    ):
-        call_score += 3
-        reasons_call.append(
-            "5m uptrend"
-        )
-
-    elif (
-        latest_5["ema20"] <
-        latest_5["ema50"]
-    ):
-        put_score += 3
-        reasons_put.append(
-            "5m downtrend"
-        )
-
-    # ========================================================
-    # 1-MINUTE TREND
-    # ========================================================
-
-    if (
-        latest_1["ema9"] >
-        latest_1["ema21"]
-    ):
-        call_score += 2
-        reasons_call.append(
-            "1m bullish"
-        )
-
-    elif (
-        latest_1["ema9"] <
-        latest_1["ema21"]
-    ):
-        put_score += 2
-        reasons_put.append(
-            "1m bearish"
-        )
-
-    # ========================================================
-    # MACD
-    # ========================================================
-
-    if (
-        latest_1["macd"] >
-        latest_1["macd_signal"]
-        and
-        latest_1["macd_hist"] > 0
-    ):
-        call_score += 2
-        reasons_call.append(
-            "MACD bullish"
-        )
-
-    elif (
-        latest_1["macd"] <
-        latest_1["macd_signal"]
-        and
-        latest_1["macd_hist"] < 0
-    ):
-        put_score += 2
-        reasons_put.append(
-            "MACD bearish"
-        )
-
-    # ========================================================
-    # RSI
-    # ========================================================
-
-    if 52 <= rsi <= 68:
-        call_score += 1
-        reasons_call.append(
-            "RSI bullish zone"
-        )
-
-    elif 32 <= rsi <= 48:
-        put_score += 1
-        reasons_put.append(
-            "RSI bearish zone"
-        )
-
-    # ========================================================
-    # CANDLE DIRECTION
-    # ========================================================
-
-    if latest_1["close"] > latest_1["open"]:
-        call_score += 1
-        reasons_call.append(
-            "bullish candle"
-        )
-
-    elif latest_1["close"] < latest_1["open"]:
-        put_score += 1
-        reasons_put.append(
-            "bearish candle"
-        )
-
-    # ========================================================
-    # SUPPORT / RESISTANCE FILTER
-    # ========================================================
-
-    recent_high = latest_1[
-        "recent_high"
-    ]
-
-    recent_low = latest_1[
-        "recent_low"
-    ]
-
-    # Don't CALL directly into recent resistance
-    if (
-        not pd.isna(recent_high)
-        and price >= recent_high
-    ):
-        call_score = min(
-            call_score,
-            MIN_SCORE - 1
-        )
-
-    # Don't PUT directly into recent support
-    if (
-        not pd.isna(recent_low)
-        and price <= recent_low
-    ):
-        put_score = min(
-            put_score,
-            MIN_SCORE - 1
-        )
-
-    # ========================================================
-    # FINAL DECISION
-    # ========================================================
-
-    separation = abs(
-        call_score -
-        put_score
-    )
-
-    signal = None
-    reasons = []
-
-    # Strong CALL
-    if (
-        call_score >= MIN_SCORE
-        and
-        call_score - put_score
-        >= MIN_SEPARATION
-        and
-        latest_5["ema20"] >
-        latest_5["ema50"]
-        and
-        latest_1["ema9"] >
-        latest_1["ema21"]
-    ):
-        signal = "CALL"
-        reasons = reasons_call
-
-    # Strong PUT
-    elif (
-        put_score >= MIN_SCORE
-        and
-        put_score - call_score
-        >= MIN_SEPARATION
-        and
-        latest_5["ema20"] <
-        latest_5["ema50"]
-        and
-        latest_1["ema9"] <
-        latest_1["ema21"]
-    ):
-        signal = "PUT"
-        reasons = reasons_put
-
-    return {
-        "status": "SIGNAL" if signal else "WAIT",
-        "signal": signal,
-        "call": call_score,
-        "put": put_score,
-        "rsi": rsi,
-        "price": price,
-        "body_ratio": body_ratio,
-        "timestamp": one.index[-1],
-        "reasons": reasons,
-        "separation": separation,
-    }
-
-
-# ============================================================
-# CONNECT TO IQ OPTION
-# ============================================================
-
-print("=" * 72)
-print("🚀 VERSION 3 GITHUB LIVE SIGNAL SCANNER")
-print("=" * 72)
-
-print("🧪 Account: PRACTICE / DEMO")
-print("📡 Live market data: ON")
-print(
-    "📊 Markets:",
-    ", ".join(PAIRS)
-)
-print(
-    f"📚 History: {CANDLE_COUNT} × 1-minute candles"
-)
-print(
-    f"⏱️ Expiry: {EXPIRY_MINUTES} minutes"
-)
-print("📨 Telegram: ON")
-print("💰 Automatic trading: OFF")
-print("=" * 72)
-
-
-# ============================================================
-# IQ OPTION CONNECTION
-# ============================================================
-
-print()
-print("🔐 Connecting to IQ Option...")
-
-Iq = IQ_Option(
-    IQ_EMAIL,
-    IQ_PASSWORD
-)
-
-connected, reason = Iq.connect()
-
-if not connected:
-    raise RuntimeError(
-        f"IQ Option connection failed: {reason}"
-    )
-
-print("✅ IQ Option connection successful")
-
-Iq.change_balance(
-    ACCOUNT_MODE
-)
-
-print(
-    "🧪 Account mode confirmed:",
-    ACCOUNT_MODE
-)
-
-
-# ============================================================
-# TELEGRAM TEST
-# ============================================================
-
-print()
-print("📨 Testing Telegram connection...")
-
-telegram_ok = send_telegram(
-    "🟢 V3 SCANNER ONLINE\n\n"
-    "📡 GitHub Actions scanner connected.\n"
-    "🧪 Mode: PRACTICE / DEMO\n"
-    "💰 Automatic trading: OFF"
-)
-
-if not telegram_ok:
-    raise RuntimeError(
-        "Telegram connection failed"
-    )
-
-
-# ============================================================
-# SCAN MARKETS
-# ============================================================
-
-print()
-print("=" * 72)
-print(
-    "🔎 MARKET SCAN",
-    time.strftime("%Y-%m-%d %H:%M:%S")
-)
-print("=" * 72)
-
-signals_found = []
-
-for pair in PAIRS:
-
-    try:
-
-        result = analyze_pair(pair)
-
-        if result["status"] == "SIGNAL":
-
-            signal = result["signal"]
-
-            print(
-                f"🚨 {pair} | "
-                f"{signal} | "
-                f"CALL {result['call']} | "
-                f"PUT {result['put']} | "
-                f"RSI {result['rsi']:.1f}"
-            )
-
-            signals_found.append(
-                (pair, result)
-            )
-
-        else:
-
-            print(
-                f"⏸️ {pair} | "
-                f"CALL {result.get('call', 0)} | "
-                f"PUT {result.get('put', 0)} | "
-                f"RSI {result.get('rsi', 0):.1f} | "
-                f"{result.get('reason', 'No high-quality signal')}"
-            )
-
-    except Exception as e:
-
-        print(
-            f"❌ {pair} | ERROR | {e}"
-        )
-
-
-# ============================================================
-# SEND SIGNALS
-# ============================================================
-
-print()
-print("=" * 72)
-
-if not signals_found:
-
-    print(
-        "💤 No high-quality signal this scan."
-    )
-
-else:
-
-    print(
-        f"🚨 {len(signals_found)} "
-        "high-quality signal(s) found."
-    )
-
-    for pair, result in signals_found:
-
-        direction_emoji = (
-            "🟢" if result["signal"] == "CALL"
-            else "🔴"
-        )
-
-        reasons_text = "\n".join(
-            f"• {reason}"
-            for reason in result["reasons"]
-        )
-
-        message = (
-            f"🚨 V3 TRADING SIGNAL\n\n"
-            f"{direction_emoji} "
-            f"{result['signal']}\n"
-            f"📊 Pair: {pair}\n"
-            f"💰 Price: {result['price']}\n"
-            f"⏱️ Expiry: "
-            f"{EXPIRY_MINUTES} minutes\n\n"
-            f"📈 CALL score: "
-            f"{result['call']}\n"
-            f"📉 PUT score: "
-            f"{result['put']}\n"
-            f"📊 RSI: "
-            f"{result['rsi']:.1f}\n\n"
-            f"🧠 Confirmation:\n"
-            f"{reasons_text}\n\n"
-            f"🧪 PRACTICE / DEMO ONLY\n"
-            f"💰 Automatic trading: OFF"
-        )
-
-        send_telegram(
-            message
-        )
-
-
-# ============================================================
-# FINISH
-# ============================================================
-
-print()
-print("=" * 72)
-print("✅ SCAN COMPLETE")
-print("💰 No automatic trades were placed.")
-print("=" * 72)
+    # CORE VALUES
+    # ------------------------------------------
