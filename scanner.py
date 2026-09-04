@@ -7,11 +7,12 @@ from datetime import datetime, timezone
 import requests
 import pandas as pd
 import numpy as np
+
 from iqoptionapi.stable_api import IQ_Option
 
 
 # ============================================================
-# V4.1 CONFIG
+# V4.2 PROFESSIONAL SIGNAL ENGINE
 # ============================================================
 
 PAIRS = [
@@ -23,6 +24,15 @@ PAIRS = [
     "NZDJPY",
 ]
 
+OTC_PAIRS = [
+    "EURUSD-OTC",
+    "GBPUSD-OTC",
+    "USDJPY-OTC",
+    "EURJPY-OTC",
+    "GBPJPY-OTC",
+    "NZDUSD-OTC",
+]
+
 TIMEFRAMES = {
     "1m": 60,
     "5m": 300,
@@ -32,24 +42,26 @@ TIMEFRAMES = {
 CANDLE_COUNT = 250
 
 SCAN_INTERVAL = 30
+
 MAX_SIGNALS_PER_DAY = 4
 
-MIN_CONFIDENCE = 75
 MIN_SCORE = 10
-MIN_SEPARATION = 3
+MIN_CONFIDENCE = 75
 
 ACCOUNT_MODE = "PRACTICE"
+
 AUTO_TRADE = False
 
-STATE_FILE = "v41_state.json"
+STATE_FILE = "v42_state.json"
 
 
 # ============================================================
-# SECRETS
+# ENVIRONMENT
 # ============================================================
 
 IQ_EMAIL = os.getenv("IQ_EMAIL")
 IQ_PASSWORD = os.getenv("IQ_PASSWORD")
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
@@ -59,34 +71,52 @@ CHAT_ID = os.getenv("CHAT_ID")
 # ============================================================
 
 def telegram(message):
+
     if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram credentials missing", flush=True)
+        print("Telegram credentials missing.", flush=True)
         return False
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
     try:
+
+        url = (
+            f"https://api.telegram.org/bot"
+            f"{BOT_TOKEN}/sendMessage"
+        )
+
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": message,
+        }
+
         response = requests.post(
             url,
-            data={
-                "chat_id": CHAT_ID,
-                "text": message,
-            },
+            json=payload,
             timeout=20,
         )
 
+        if response.status_code == 200:
+
+            print(
+                "✅ Telegram message sent.",
+                flush=True
+            )
+
+            return True
+
         print(
-            f"Telegram HTTP {response.status_code}",
+            f"Telegram error: {response.status_code}",
             flush=True
         )
 
-        if response.status_code != 200:
-            print(response.text, flush=True)
-
-        return response.status_code == 200
+        return False
 
     except Exception as e:
-        print(f"Telegram error: {e}", flush=True)
+
+        print(
+            f"Telegram exception: {e}",
+            flush=True
+        )
+
         return False
 
 
@@ -95,37 +125,70 @@ def telegram(message):
 # ============================================================
 
 def current_day():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    return datetime.now(
+        timezone.utc
+    ).strftime("%Y-%m-%d")
 
 
-def load_state():
-    default = {
+def default_state():
+
+    return {
         "date": current_day(),
         "signals_today": 0,
         "last_signals": {},
         "history": [],
     }
 
+
+def load_state():
+
     try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r") as f:
-                state = json.load(f)
 
-            if state.get("date") == current_day():
-                return state
+        if not os.path.exists(STATE_FILE):
+            return default_state()
 
-    except Exception as e:
-        print(f"State warning: {e}", flush=True)
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
 
-    return default
+            state = json.load(f)
+
+        if state.get("date") != current_day():
+
+            return default_state()
+
+        return state
+
+    except Exception:
+
+        return default_state()
 
 
 def save_state(state):
+
     try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
+
+        with open(
+            STATE_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(
+                state,
+                f,
+                indent=2
+            )
+
     except Exception as e:
-        print(f"State save warning: {e}", flush=True)
+
+        print(
+            f"State save error: {e}",
+            flush=True
+        )
 
 
 # ============================================================
@@ -133,6 +196,7 @@ def save_state(state):
 # ============================================================
 
 def ema(series, period):
+
     return series.ewm(
         span=period,
         adjust=False
@@ -140,6 +204,7 @@ def ema(series, period):
 
 
 def rsi(series, period=14):
+
     delta = series.diff()
 
     gain = delta.clip(lower=0)
@@ -155,63 +220,68 @@ def rsi(series, period=14):
         adjust=False
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs = avg_gain / avg_loss.replace(
+        0,
+        np.nan
+    )
 
-    result = 100 - (100 / (1 + rs))
+    result = 100 - (
+        100 / (1 + rs)
+    )
 
     return result.fillna(50)
 
 
 def atr(df, period=14):
-    high_low = df["high"] - df["low"]
 
-    high_close = (
-        df["high"] - df["close"].shift()
-    ).abs()
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
 
-    low_close = (
-        df["low"] - df["close"].shift()
-    ).abs()
+    previous_close = close.shift(1)
 
-    true_range = pd.concat(
+    tr = pd.concat(
         [
-            high_low,
-            high_close,
-            low_close,
+            high - low,
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
         ],
-        axis=1,
+        axis=1
     ).max(axis=1)
 
-    return true_range.rolling(period).mean()
+    return tr.ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
 
 
-def add_indicators(df):
-    df = df.copy()
+def macd(series):
 
-    df["ema9"] = ema(df["close"], 9)
-    df["ema21"] = ema(df["close"], 21)
-    df["ema50"] = ema(df["close"], 50)
-    df["ema100"] = ema(df["close"], 100)
+    fast = ema(series, 12)
+    slow = ema(series, 26)
 
-    df["rsi"] = rsi(df["close"])
+    line = fast - slow
 
-    fast = ema(df["close"], 12)
-    slow = ema(df["close"], 26)
+    signal = ema(line, 9)
 
-    df["macd"] = fast - slow
-    df["macd_signal"] = ema(df["macd"], 9)
+    histogram = line - signal
 
-    df["atr"] = atr(df)
-
-    return df
+    return line, signal, histogram
 
 
 # ============================================================
-# CANDLES
+# CANDLE DATA
 # ============================================================
 
-def get_candles(iq, pair, timeframe, count):
+def get_candles(
+    iq,
+    pair,
+    timeframe,
+    count=CANDLE_COUNT
+):
+
     try:
+
         candles = iq.get_candles(
             pair,
             timeframe,
@@ -220,16 +290,21 @@ def get_candles(iq, pair, timeframe, count):
         )
 
         if not candles:
-            print(
-                f"{pair} {timeframe}: no candles",
-                flush=True
-            )
             return None
 
         df = pd.DataFrame(candles)
 
-        if "min" not in df.columns or "max" not in df.columns:
-            return None
+        required = [
+            "open",
+            "close",
+            "min",
+            "max",
+        ]
+
+        for column in required:
+
+            if column not in df.columns:
+                return None
 
         df = df.rename(
             columns={
@@ -238,16 +313,17 @@ def get_candles(iq, pair, timeframe, count):
             }
         )
 
-        needed = [
-            "open",
-            "high",
-            "low",
-            "close",
-        ]
+        df = df[
+            [
+                "open",
+                "high",
+                "low",
+                "close",
+            ]
+        ].copy()
 
-        df = df[needed].copy()
+        for column in df.columns:
 
-        for column in needed:
             df[column] = pd.to_numeric(
                 df[column],
                 errors="coerce"
@@ -255,319 +331,350 @@ def get_candles(iq, pair, timeframe, count):
 
         df = df.dropna()
 
-        if len(df) < 120:
+        if len(df) < 80:
             return None
 
         return df.reset_index(drop=True)
 
     except Exception as e:
+
         print(
-            f"{pair} {timeframe} candle error: {e}",
+            f"Candle error {pair}: {e}",
             flush=True
         )
+
         return None
 
 
 # ============================================================
-# TIMEFRAME TREND
+# MARKET AVAILABILITY
+# ============================================================
+
+def get_open_assets(iq):
+
+    try:
+
+        return iq.get_all_open_time()
+
+    except Exception as e:
+
+        print(
+            f"Open-time check failed: {e}",
+            flush=True
+        )
+
+        return {}
+
+
+def asset_is_open(open_assets, pair):
+
+    try:
+
+        for market_type in [
+            "turbo",
+            "binary",
+            "digital",
+        ]:
+
+            market = open_assets.get(
+                market_type,
+                {}
+            )
+
+            asset = market.get(pair)
+
+            if asset and asset.get("open") is True:
+
+                return True
+
+        return False
+
+    except Exception:
+
+        return False
+
+
+def choose_available_asset(
+    iq,
+    regular_pair,
+    open_assets
+):
+
+    # --------------------------------------------------------
+    # FIRST: regular market
+    # --------------------------------------------------------
+
+    if asset_is_open(
+        open_assets,
+        regular_pair
+    ):
+
+        return regular_pair, "REGULAR"
+
+    # --------------------------------------------------------
+    # SECOND: OTC
+    # --------------------------------------------------------
+
+    otc_pair = (
+        regular_pair
+        + "-OTC"
+    )
+
+    if asset_is_open(
+        open_assets,
+        otc_pair
+    ):
+
+        return otc_pair, "OTC"
+
+    # --------------------------------------------------------
+    # NOTHING OPEN
+    # --------------------------------------------------------
+
+    return None, None
+
+
+# ============================================================
+# TREND / MARKET STRUCTURE
 # ============================================================
 
 def timeframe_bias(df):
-    if df is None or len(df) < 100:
-        return "NEUTRAL", 0
 
-    df = add_indicators(df)
-    c = df.iloc[-1]
+    close = df["close"]
 
-    bullish = 0
-    bearish = 0
+    e20 = ema(close, 20)
+    e50 = ema(close, 50)
+    e100 = ema(close, 100)
 
-    if c["ema9"] > c["ema21"]:
-        bullish += 1
-    else:
-        bearish += 1
+    last = close.iloc[-1]
 
-    if c["ema21"] > c["ema50"]:
-        bullish += 1
-    else:
-        bearish += 1
+    if (
+        last > e20.iloc[-1]
+        and e20.iloc[-1] > e50.iloc[-1]
+        and e50.iloc[-1] > e100.iloc[-1]
+    ):
 
-    if c["ema50"] > c["ema100"]:
-        bullish += 1
-    else:
-        bearish += 1
+        return "CALL"
 
-    if c["macd"] > c["macd_signal"]:
-        bullish += 1
-    else:
-        bearish += 1
+    if (
+        last < e20.iloc[-1]
+        and e20.iloc[-1] < e50.iloc[-1]
+        and e50.iloc[-1] < e100.iloc[-1]
+    ):
 
-    if bullish >= 3:
-        return "CALL", bullish
+        return "PUT"
 
-    if bearish >= 3:
-        return "PUT", bearish
-
-    return "NEUTRAL", max(bullish, bearish)
+    return "NEUTRAL"
 
 
-# ============================================================
-# SUPPORT / RESISTANCE
-# ============================================================
+def support_resistance(df):
 
-def market_levels(df, lookback=50):
-    recent = df.tail(lookback)
+    recent = df.tail(50)
 
-    support = float(recent["low"].min())
-    resistance = float(recent["high"].max())
+    support = recent["low"].min()
+    resistance = recent["high"].max()
 
     return support, resistance
 
 
 # ============================================================
-# 1-MINUTE SETUP
+# ENTRY ANALYSIS
 # ============================================================
 
 def analyze_entry(df):
-    if df is None or len(df) < 120:
-        return None
 
-    df = add_indicators(df)
+    close = df["close"]
 
-    c = df.iloc[-1]
-    p = df.iloc[-2]
+    e9 = ema(close, 9)
+    e21 = ema(close, 21)
+    e50 = ema(close, 50)
 
-    call_score = 0
-    put_score = 0
+    r = rsi(close)
 
-    call_reasons = []
-    put_reasons = []
+    macd_line, macd_signal, macd_hist = macd(
+        close
+    )
 
-    # --------------------------------------------------------
-    # EMA TREND
-    # --------------------------------------------------------
+    a = atr(df)
 
-    if c["ema9"] > c["ema21"]:
-        call_score += 2
-        call_reasons.append("1m EMA bullish")
+    score_call = 0
+    score_put = 0
 
-    if c["ema9"] < c["ema21"]:
-        put_score += 2
-        put_reasons.append("1m EMA bearish")
+    reasons_call = []
+    reasons_put = []
 
     # --------------------------------------------------------
-    # MEDIUM TREND
+    # EMA STRUCTURE
     # --------------------------------------------------------
-
-    if c["ema21"] > c["ema50"]:
-        call_score += 2
-        call_reasons.append("1m medium trend bullish")
-
-    if c["ema21"] < c["ema50"]:
-        put_score += 2
-        put_reasons.append("1m medium trend bearish")
-
-    # --------------------------------------------------------
-    # MACD
-    # --------------------------------------------------------
-
-    if c["macd"] > c["macd_signal"]:
-        call_score += 2
-        call_reasons.append("MACD bullish")
-
-    if c["macd"] < c["macd_signal"]:
-        put_score += 2
-        put_reasons.append("MACD bearish")
-
-    # Fresh cross gets an additional point.
-    if (
-        c["macd"] > c["macd_signal"]
-        and p["macd"] <= p["macd_signal"]
-    ):
-        call_score += 1
-        call_reasons.append("Fresh MACD bullish cross")
 
     if (
-        c["macd"] < c["macd_signal"]
-        and p["macd"] >= p["macd_signal"]
+        e9.iloc[-1]
+        > e21.iloc[-1]
+        > e50.iloc[-1]
     ):
-        put_score += 1
-        put_reasons.append("Fresh MACD bearish cross")
+
+        score_call += 3
+        reasons_call.append(
+            "EMA bullish alignment"
+        )
+
+    elif (
+        e9.iloc[-1]
+        < e21.iloc[-1]
+        < e50.iloc[-1]
+    ):
+
+        score_put += 3
+        reasons_put.append(
+            "EMA bearish alignment"
+        )
 
     # --------------------------------------------------------
     # RSI
     # --------------------------------------------------------
 
-    r = float(c["rsi"])
+    current_rsi = float(
+        r.iloc[-1]
+    )
 
-    if 52 <= r <= 67:
-        call_score += 2
-        call_reasons.append(
-            f"RSI supportive ({r:.1f})"
+    if 52 <= current_rsi <= 68:
+
+        score_call += 2
+        reasons_call.append(
+            f"RSI bullish ({current_rsi:.1f})"
         )
 
-    elif 67 < r <= 72:
-        call_score += 1
+    elif 32 <= current_rsi <= 48:
 
-    if 33 <= r <= 48:
-        put_score += 2
-        put_reasons.append(
-            f"RSI supportive ({r:.1f})"
+        score_put += 2
+        reasons_put.append(
+            f"RSI bearish ({current_rsi:.1f})"
         )
 
-    elif 28 <= r < 33:
-        put_score += 1
-
-    # Do not chase extremes.
-    if r >= 75:
-        call_score -= 3
-
-    if r <= 25:
-        put_score -= 3
-
     # --------------------------------------------------------
-    # CANDLE QUALITY
+    # MACD
     # --------------------------------------------------------
 
-    candle_range = float(
-        c["high"] - c["low"]
+    if (
+        macd_line.iloc[-1]
+        > macd_signal.iloc[-1]
+        and macd_hist.iloc[-1] > 0
+    ):
+
+        score_call += 2
+        reasons_call.append(
+            "MACD bullish momentum"
+        )
+
+    elif (
+        macd_line.iloc[-1]
+        < macd_signal.iloc[-1]
+        and macd_hist.iloc[-1] < 0
+    ):
+
+        score_put += 2
+        reasons_put.append(
+            "MACD bearish momentum"
+        )
+
+    # --------------------------------------------------------
+    # CANDLE MOMENTUM
+    # --------------------------------------------------------
+
+    last = df.iloc[-1]
+
+    candle_body = abs(
+        last["close"] - last["open"]
+    )
+
+    candle_range = (
+        last["high"] - last["low"]
     )
 
     if candle_range > 0:
 
-        body = abs(
-            float(c["close"] - c["open"])
+        body_ratio = (
+            candle_body / candle_range
         )
-
-        body_ratio = body / candle_range
 
         if body_ratio >= 0.55:
 
-            if c["close"] > c["open"]:
-                call_score += 2
-                call_reasons.append(
+            if last["close"] > last["open"]:
+
+                score_call += 2
+                reasons_call.append(
                     "Strong bullish candle"
                 )
 
-            elif c["close"] < c["open"]:
-                put_score += 2
-                put_reasons.append(
+            elif last["close"] < last["open"]:
+
+                score_put += 2
+                reasons_put.append(
                     "Strong bearish candle"
                 )
-
-    # --------------------------------------------------------
-    # MOMENTUM
-    # --------------------------------------------------------
-
-    last_three = df.tail(3)
-
-    rising_closes = (
-        last_three["close"].iloc[-1]
-        > last_three["close"].iloc[0]
-    )
-
-    if rising_closes:
-        call_score += 1
-        call_reasons.append("Short-term upward momentum")
-
-    else:
-        put_score += 1
-        put_reasons.append("Short-term downward momentum")
 
     # --------------------------------------------------------
     # ATR / VOLATILITY
     # --------------------------------------------------------
 
-    current_atr = float(c["atr"])
-
-    if not np.isfinite(current_atr) or current_atr <= 0:
-        return None
-
-    recent_ranges = (
-        df["high"] - df["low"]
-    ).tail(20)
-
-    median_range = float(
-        recent_ranges.median()
+    atr_value = float(
+        a.iloc[-1]
     )
 
-    if median_range <= 0:
-        return None
+    if atr_value > 0:
 
-    volatility_ratio = current_atr / median_range
-
-    # Extremely dead markets are rejected.
-    if volatility_ratio < 0.65:
-        return None
+        score_call += 1
+        score_put += 1
 
     # --------------------------------------------------------
-    # SUPPORT / RESISTANCE
+    # RECENT CANDLE AGREEMENT
     # --------------------------------------------------------
 
-    support, resistance = market_levels(df)
+    previous = df.iloc[-2]
 
-    price = float(c["close"])
+    if (
+        last["close"] > last["open"]
+        and previous["close"] > previous["open"]
+    ):
 
-    distance_to_resistance = (
-        resistance - price
-    )
+        score_call += 1
+        reasons_call.append(
+            "Two-candle bullish momentum"
+        )
 
-    distance_to_support = (
-        price - support
-    )
+    elif (
+        last["close"] < last["open"]
+        and previous["close"] < previous["open"]
+    ):
 
-    # Don't blindly buy directly underneath resistance.
-    if distance_to_resistance > 0:
-
-        if distance_to_resistance < current_atr * 0.35:
-            call_score -= 2
-
-    # Don't blindly sell directly above support.
-    if distance_to_support > 0:
-
-        if distance_to_support < current_atr * 0.35:
-            put_score -= 2
+        score_put += 1
+        reasons_put.append(
+            "Two-candle bearish momentum"
+        )
 
     # --------------------------------------------------------
-    # CHOOSE DIRECTION
+    # DECISION
     # --------------------------------------------------------
 
-    if call_score > put_score:
-        direction = "CALL"
-        score = call_score
-        opposing = put_score
-        reasons = call_reasons
+    if score_call > score_put:
 
-    elif put_score > call_score:
-        direction = "PUT"
-        score = put_score
-        opposing = call_score
-        reasons = put_reasons
+        return {
+            "direction": "CALL",
+            "score": score_call,
+            "rsi": current_rsi,
+            "reasons": reasons_call,
+        }
 
-    else:
-        return None
+    if score_put > score_call:
 
-    separation = score - opposing
+        return {
+            "direction": "PUT",
+            "score": score_put,
+            "rsi": current_rsi,
+            "reasons": reasons_put,
+        }
 
-    if score < MIN_SCORE:
-        return None
-
-    if separation < MIN_SEPARATION:
-        return None
-
-    return {
-        "direction": direction,
-        "score": score,
-        "opposing_score": opposing,
-        "separation": separation,
-        "rsi": r,
-        "atr": current_atr,
-        "volatility_ratio": volatility_ratio,
-        "price": price,
-        "support": support,
-        "resistance": resistance,
-        "reasons": reasons,
-    }
+    return None
 
 
 # ============================================================
@@ -575,56 +682,59 @@ def analyze_entry(df):
 # ============================================================
 
 def calculate_confidence(
-    entry,
+    entry_score,
     bias_5m,
-    strength_5m,
     bias_15m,
-    strength_15m,
+    direction
 ):
-    direction = entry["direction"]
 
-    confidence = 50.0
+    confidence = 50
 
-    # Entry quality.
-    confidence += min(
-        18,
-        entry["score"] * 1.5
+    # Entry strength
+
+    confidence += (
+        entry_score * 2
     )
 
-    # Score separation.
-    confidence += min(
-        8,
-        entry["separation"] * 2
-    )
+    # Higher timeframe confirmation
 
-    # 5m confirmation.
     if bias_5m == direction:
+
+        confidence += 8
+
+    if bias_15m == direction:
+
         confidence += 10
 
-    elif bias_5m != "NEUTRAL":
+    if (
+        bias_5m == direction
+        and bias_15m == direction
+    ):
+
+        confidence += 7
+
+    # Contradiction penalty
+
+    if (
+        bias_5m != "NEUTRAL"
+        and bias_5m != direction
+    ):
+
         confidence -= 8
 
-    # 15m confirmation.
-    if bias_15m == direction:
-        confidence += 10
+    if (
+        bias_15m != "NEUTRAL"
+        and bias_15m != direction
+    ):
 
-    elif bias_15m != "NEUTRAL":
         confidence -= 10
 
-    # Strength of higher timeframe trends.
-    if bias_5m == direction and strength_5m >= 4:
-        confidence += 3
-
-    if bias_15m == direction and strength_15m >= 4:
-        confidence += 3
-
-    # Keep confidence honest.
     confidence = max(
         0,
         min(95, confidence)
     )
 
-    return round(confidence)
+    return int(confidence)
 
 
 # ============================================================
@@ -633,68 +743,72 @@ def calculate_confidence(
 
 def choose_expiry(
     confidence,
-    entry,
     bias_5m,
     bias_15m,
+    entry_score
 ):
-    direction = entry["direction"]
 
-    aligned_5m = bias_5m == direction
-    aligned_15m = bias_15m == direction
-
-    # Strong multi-timeframe setup.
     if (
         confidence >= 88
-        and aligned_5m
-        and aligned_15m
-        and entry["score"] >= 14
+        and bias_5m == bias_15m
+        and bias_5m != "NEUTRAL"
+        and entry_score >= 14
     ):
+
         return 3
 
-    # Normal strong setup.
-    if confidence >= 80 and aligned_5m:
+    if (
+        confidence >= 82
+        and bias_5m != "NEUTRAL"
+        and bias_5m == bias_15m
+    ):
+
         return 5
 
-    # Slower trend-following setup.
     if (
         confidence >= 75
-        and aligned_5m
-        and aligned_15m
+        and (
+            bias_5m != "NEUTRAL"
+            or bias_15m != "NEUTRAL"
+        )
     ):
-        return 10
 
-    return 5
+        return 5
+
+    return 10
 
 
 # ============================================================
 # COMPLETE PAIR ANALYSIS
 # ============================================================
 
-def analyze_pair(iq, pair):
+def analyze_pair(
+    iq,
+    pair,
+    market_type
+):
+
     print(
-        f"Analyzing {pair}...",
+        f"🔎 Analyzing {pair} [{market_type}]",
         flush=True
     )
 
     df_1m = get_candles(
         iq,
         pair,
-        TIMEFRAMES["1m"],
-        CANDLE_COUNT
+        TIMEFRAMES["1m"]
     )
 
     df_5m = get_candles(
         iq,
         pair,
-        TIMEFRAMES["5m"],
-        CANDLE_COUNT
+        TIMEFRAMES["5m"]
     )
 
     df_15m = get_candles(
         iq,
         pair,
-        TIMEFRAMES["15m"],
-        CANDLE_COUNT
+        TIMEFRAMES["15m"]
     )
 
     if (
@@ -702,128 +816,207 @@ def analyze_pair(iq, pair):
         or df_5m is None
         or df_15m is None
     ):
+
         print(
-            f"{pair}: incomplete timeframe data",
+            f"{pair}: insufficient candles",
             flush=True
         )
+
         return None
 
-    entry = analyze_entry(df_1m)
-
-    if not entry:
-        return None
-
-    bias_5m, strength_5m = timeframe_bias(
+    bias_5m = timeframe_bias(
         df_5m
     )
 
-    bias_15m, strength_15m = timeframe_bias(
+    bias_15m = timeframe_bias(
         df_15m
     )
 
+    entry = analyze_entry(
+        df_1m
+    )
+
+    if not entry:
+
+        return None
+
+    direction = entry[
+        "direction"
+    ]
+
+    score = entry[
+        "score"
+    ]
+
+    if score < MIN_SCORE:
+
+        print(
+            f"{pair}: score {score} rejected",
+            flush=True
+        )
+
+        return None
+
     confidence = calculate_confidence(
-        entry,
+        score,
         bias_5m,
-        strength_5m,
         bias_15m,
-        strength_15m,
+        direction
     )
 
     if confidence < MIN_CONFIDENCE:
+
         print(
-            f"{pair}: rejected — "
-            f"{entry['direction']} "
-            f"{confidence}% confidence",
+            f"{pair}: confidence "
+            f"{confidence}% rejected",
             flush=True
         )
+
+        return None
+
+    # --------------------------------------------------------
+    # Separation / confirmation
+    # --------------------------------------------------------
+
+    separation = 0
+
+    if bias_5m == direction:
+
+        separation += 1
+
+    if bias_15m == direction:
+
+        separation += 1
+
+    if separation < 1:
+
         return None
 
     expiry = choose_expiry(
         confidence,
-        entry,
         bias_5m,
         bias_15m,
+        score
     )
 
-    # Add higher-timeframe confirmation
-    # to the reasons shown to the user.
-    reasons = list(entry["reasons"])
+    support, resistance = (
+        support_resistance(df_1m)
+    )
 
-    if bias_5m == entry["direction"]:
-        reasons.append(
-            f"5m trend confirms {entry['direction']}"
-        )
-
-    if bias_15m == entry["direction"]:
-        reasons.append(
-            f"15m trend confirms {entry['direction']}"
-        )
-
-    if bias_5m != "NEUTRAL":
-        reasons.append(
-            f"5m bias: {bias_5m}"
-        )
-
-    if bias_15m != "NEUTRAL":
-        reasons.append(
-            f"15m bias: {bias_15m}"
-        )
+    entry_price = float(
+        df_1m["close"].iloc[-1]
+    )
 
     return {
         "pair": pair,
-        "direction": entry["direction"],
-        "score": entry["score"],
-        "separation": entry["separation"],
+        "market": market_type,
+        "direction": direction,
+        "score": score,
         "confidence": confidence,
         "expiry": expiry,
-        "price": entry["price"],
-        "rsi": round(entry["rsi"], 1),
-        "atr": entry["atr"],
+        "rsi": entry["rsi"],
+        "entry": entry_price,
         "bias_5m": bias_5m,
         "bias_15m": bias_15m,
-        "reasons": reasons,
+        "separation": separation,
+        "support": float(support),
+        "resistance": float(resistance),
+        "reasons": entry["reasons"],
+        "timestamp": datetime.now(
+            timezone.utc
+        ).isoformat(),
     }
 
 
 # ============================================================
-# SIGNAL MESSAGE
+# SIGNAL FORMAT
 # ============================================================
 
-def format_signal(signal):
-    icon = (
+def format_signal(result):
+
+    direction_icon = (
         "🟢"
-        if signal["direction"] == "CALL"
+        if result["direction"] == "CALL"
         else "🔴"
     )
 
     reasons = "\n".join(
-        f"• {reason}"
-        for reason in signal["reasons"][:7]
+        "• " + reason
+        for reason in result["reasons"]
     )
 
     return (
-        "🎯 V4.1 PREMIUM SIGNAL\n\n"
-        f"💱 Pair: {signal['pair']}\n"
-        f"{icon} Direction: {signal['direction']}\n"
-        f"⏱ Expiry: {signal['expiry']} minutes\n\n"
-        f"📊 Score: {signal['score']}\n"
-        f"📐 Separation: {signal['separation']}\n"
-        f"🧠 Confidence: {signal['confidence']}%\n"
-        f"💰 Entry reference: {signal['price']}\n"
-        f"📈 RSI: {signal['rsi']}\n"
-        f"5️⃣ 5m trend: {signal['bias_5m']}\n"
-        f"1️⃣5️⃣ 15m trend: {signal['bias_15m']}\n\n"
-        f"Why:\n{reasons}\n\n"
+        "🎯 V4.2 PREMIUM SIGNAL\n\n"
+
+        f"💱 Pair: {result['pair']}\n"
+        f"📊 Market: {result['market']}\n"
+
+        f"{direction_icon} Direction: "
+        f"{result['direction']}\n"
+
+        f"⏱ Expiry: "
+        f"{result['expiry']} minutes\n"
+
+        f"📊 Score: "
+        f"{result['score']}\n"
+
+        f"🧠 Model Confidence: "
+        f"{result['confidence']}%\n"
+
+        f"💰 Entry reference: "
+        f"{result['entry']:.6f}\n"
+
+        f"📈 RSI: "
+        f"{result['rsi']:.1f}\n\n"
+
+        f"5M Bias: {result['bias_5m']}\n"
+        f"15M Bias: {result['bias_15m']}\n\n"
+
+        "Why:\n"
+        f"{reasons}\n\n"
+
         "⚠️ Practice/demo signal\n"
-        "🤖 Auto-trading: OFF"
+        "🤖 Auto-trading: OFF\n"
+        "🔢 Daily limit: 4 signals maximum"
     )
 
 
 # ============================================================
-# IQ OPTION CONNECTION
+# MAIN
 # ============================================================
 
-def connect_iq():
+def main():
+
+    print(
+        "🔥 V4.2 PROFESSIONAL SIGNAL ENGINE",
+        flush=True
+    )
+
+    print(
+        "🛡️ Maximum 4 signals per day",
+        flush=True
+    )
+
+    print(
+        "🌐 Regular + OTC availability detection enabled",
+        flush=True
+    )
+
+    print(
+        "🤖 Auto-trading: OFF",
+        flush=True
+    )
+
+    state = load_state()
+
+    telegram(
+        "🟢 V4.2 SCANNER STARTING\n\n"
+        "Professional signal engine online.\n"
+        "Maximum 4 signals per day.\n"
+        "Regular + OTC market detection enabled.\n"
+        "Auto-trading: OFF."
+    )
+
     print(
         "Connecting to IQ Option...",
         flush=True
@@ -834,21 +1027,21 @@ def connect_iq():
         IQ_PASSWORD
     )
 
-    success, reason = iq.connect()
+    iq.connect()
 
-    if not success:
+    if not iq.check_connect():
+
         print(
-            f"IQ Option connection failed: {reason}",
+            "❌ IQ Option connection failed.",
             flush=True
         )
 
         telegram(
-            "🔴 V4.1 ERROR\n\n"
-            "IQ Option connection failed.\n"
-            f"Reason: {reason}"
+            "🔴 V4.2 ERROR\n\n"
+            "IQ Option connection failed."
         )
 
-        return None
+        return
 
     print(
         "✅ IQ Option connected",
@@ -856,89 +1049,124 @@ def connect_iq():
     )
 
     try:
-        iq.change_balance("PRACTICE")
+
+        iq.change_balance(
+            ACCOUNT_MODE
+        )
+
     except Exception:
+
         pass
 
-    return iq
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    print("=" * 60, flush=True)
-    print(
-        "🚀 V4.1 PROFESSIONAL SIGNAL ENGINE",
-        flush=True
-    )
-    print("=" * 60, flush=True)
-
     telegram(
-        "🟢 V4.1 SCANNER STARTING\n\n"
-        "Telegram: CONNECTED\n"
-        "Market engine: STARTING\n"
-        "Account: PRACTICE / DEMO\n"
-        "Auto-trading: OFF\n\n"
-        "Maximum signals today: 4\n"
-        "Minimum confidence: 75%"
-    )
-
-    if not IQ_EMAIL or not IQ_PASSWORD:
-        telegram(
-            "🔴 V4.1 ERROR\n\n"
-            "IQ Option credentials are missing."
-        )
-        return
-
-    iq = connect_iq()
-
-    if iq is None:
-        return
-
-    state = load_state()
-
-    telegram(
-        "🟢 V4.1 SCANNER ONLINE\n\n"
-        "IQ Option: CONNECTED\n"
-        "1m: Entry timing\n"
-        "5m: Primary trend\n"
-        "15m: Confirmation\n"
-        "Daily limit: 4\n"
-        "Auto-trading: OFF\n\n"
-        "Waiting for high-quality setups."
+        "🟢 V4.2 SCANNER ONLINE\n\n"
+        "Market-status protection: ON\n"
+        "OTC support: ON\n"
+        "Daily maximum: 4\n"
+        "Auto-trading: OFF"
     )
 
     while True:
 
         try:
 
-            if state["date"] != current_day():
-                state = load_state()
+            # ------------------------------------------------
+            # RESET DAILY STATE
+            # ------------------------------------------------
 
-            if state["signals_today"] >= MAX_SIGNALS_PER_DAY:
+            if state["date"] != current_day():
+
+                state = default_state()
+
+                save_state(state)
 
                 print(
-                    "Daily limit reached.",
+                    "🔄 New trading day.",
+                    flush=True
+                )
+
+            # ------------------------------------------------
+            # HARD DAILY LIMIT
+            # ------------------------------------------------
+
+                        if (
+                state["signals_today"]
+                >= MAX_SIGNALS_PER_DAY
+            ):
+
+                print(
+                    "🛑 Daily limit reached: "
+                    f"{MAX_SIGNALS_PER_DAY}/"
+                    f"{MAX_SIGNALS_PER_DAY}",
                     flush=True
                 )
 
                 time.sleep(300)
+
+                continue
+
+            # ------------------------------------------------
+            # GET REAL MARKET STATUS
+            # ------------------------------------------------
+
+            open_assets = get_open_assets(iq)
+
+            if not open_assets:
+
+                print(
+                    "⚠️ Could not obtain market status.",
+                    flush=True
+                )
+
+                time.sleep(60)
+
                 continue
 
             candidates = []
 
-            for pair in PAIRS:
+            # ------------------------------------------------
+            # SCAN PAIRS
+            # ------------------------------------------------
+
+            for regular_pair in PAIRS:
+
+                asset, market_type = (
+                    choose_available_asset(
+                        iq,
+                        regular_pair,
+                        open_assets
+                    )
+                )
+
+                if not asset:
+
+                    print(
+                        f"⏸ {regular_pair}: "
+                        "regular + OTC unavailable",
+                        flush=True
+                    )
+
+                    continue
+
+                print(
+                    f"✅ {asset} is OPEN "
+                    f"[{market_type}]",
+                    flush=True
+                )
 
                 result = analyze_pair(
                     iq,
-                    pair
+                    asset,
+                    market_type
                 )
 
                 if result:
+
                     candidates.append(result)
+
+            # ------------------------------------------------
+            # SELECT BEST SIGNAL
+            # ------------------------------------------------
 
             if candidates:
 
@@ -953,18 +1181,28 @@ def main():
 
                 best = candidates[0]
 
-                last = state["last_signals"].get(
+                last = state[
+                    "last_signals"
+                ].get(
                     best["pair"]
                 )
 
-                if (
-                    last
-                    and last["direction"]
-                    == best["direction"]
-                ):
+                duplicate = False
+
+                if last:
+
+                    if (
+                        last["direction"]
+                        == best["direction"]
+                    ):
+
+                        duplicate = True
+
+                if duplicate:
 
                     print(
-                        f"{best['pair']}: duplicate ignored",
+                        f"⏸ {best['pair']}: "
+                        "duplicate direction ignored",
                         flush=True
                     )
 
@@ -974,25 +1212,37 @@ def main():
 
                     if telegram(message):
 
-                        state["signals_today"] += 1
+                        state[
+                            "signals_today"
+                        ] += 1
 
-                        state["last_signals"][
+                        state[
+                            "last_signals"
+                        ][
                             best["pair"]
                         ] = {
-                            "direction": best["direction"],
-                            "time": datetime.now(
-                                timezone.utc
-                            ).isoformat(),
+                            "direction":
+                                best["direction"],
+                            "time":
+                                datetime.now(
+                                    timezone.utc
+                                ).isoformat(),
                         }
 
-                        state["history"].append(best)
+                        state[
+                            "history"
+                        ].append(best)
 
                         save_state(state)
 
                         print(
-                            "✅ SIGNAL SENT:",
-                            best["pair"],
-                            best["direction"],
+                            "🚨 SIGNAL SENT",
+                            flush=True
+                        )
+
+                        print(
+                            f"{best['pair']} "
+                            f"{best['direction']} "
                             f"{best['confidence']}%",
                             flush=True
                         )
@@ -1004,7 +1254,9 @@ def main():
                     flush=True
                 )
 
-            time.sleep(SCAN_INTERVAL)
+            time.sleep(
+                SCAN_INTERVAL
+            )
 
         except KeyboardInterrupt:
 
@@ -1024,11 +1276,6 @@ def main():
 
             traceback.print_exc()
 
-            telegram(
-                "⚠️ V4.1 SCANNER WARNING\n\n"
-                f"{str(e)[:500]}"
-            )
-
             time.sleep(30)
 
 
@@ -1038,3 +1285,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
