@@ -31,4 +31,6 @@ jobs:
           IQ_PASSWORD: ${{ secrets.IQ_PASSWORD }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: python scanner.py
+        run:  |
+          echo "STARTING SCANNER..."
+          python -u scanner.py
