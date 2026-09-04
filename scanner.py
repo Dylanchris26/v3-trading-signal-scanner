@@ -1202,104 +1202,6 @@ def main():
 
                     print(
                         f"⏸ {best['pair']}: "
-            # HARD DAILY LIMIT
-            # ------------------------------------------------
-
-            if state["signals_today"] >= MAX_SIGNALS_PER_DAY:
-
-                print(
-                    f"🛑 Daily limit reached: "
-                    f"{MAX_SIGNALS_PER_DAY}/"
-                    f"{MAX_SIGNALS_PER_DAY}",
-                    flush=True
-                )
-
-                time.sleep(300)
-                continue
-
-            # ------------------------------------------------
-            # MARKET STATUS
-            # ------------------------------------------------
-
-            open_assets = get_open_assets(iq)
-
-            if not open_assets:
-
-                print(
-                    "⚠️ Could not obtain market status.",
-                    flush=True
-                )
-
-                time.sleep(60)
-                continue
-
-            candidates = []
-
-            # ------------------------------------------------
-            # SCAN PAIRS
-            # ------------------------------------------------
-
-            for regular_pair in PAIRS:
-
-                asset, market_type = choose_available_asset(
-                    iq,
-                    regular_pair,
-                    open_assets
-                )
-
-                if not asset:
-
-                    print(
-                        f"⏸ {regular_pair}: "
-                        "regular + OTC unavailable",
-                        flush=True
-                    )
-
-                    continue
-
-                print(
-                    f"✅ {asset} OPEN [{market_type}]",
-                    flush=True
-                )
-
-                result = analyze_pair(
-                    iq,
-                    asset,
-                    market_type
-                )
-
-                if result:
-                    candidates.append(result)
-
-            # ------------------------------------------------
-            # BEST SIGNAL
-            # ------------------------------------------------
-
-            if candidates:
-
-                candidates.sort(
-                    key=lambda x: (
-                        x["confidence"],
-                        x["score"],
-                        x["separation"]
-                    ),
-                    reverse=True
-                )
-
-                best = candidates[0]
-
-                last = state["last_signals"].get(
-                    best["pair"]
-                )
-
-                if (
-                    last
-                    and last["direction"]
-                    == best["direction"]
-                ):
-
-                    print(
-                        f"⏸ {best['pair']}: "
                         "duplicate direction ignored",
                         flush=True
                     )
@@ -1310,9 +1212,13 @@ def main():
 
                     if telegram(message):
 
-                        state["signals_today"] += 1
+                        state[
+                            "signals_today"
+                        ] += 1
 
-                        state["last_signals"][
+                        state[
+                            "last_signals"
+                        ][
                             best["pair"]
                         ] = {
                             "direction":
@@ -1320,15 +1226,24 @@ def main():
                             "time":
                                 datetime.now(
                                     timezone.utc
-                                ).isoformat()
+                                ).isoformat(),
                         }
 
-                        state["history"].append(best)
+                        state[
+                            "history"
+                        ].append(best)
 
                         save_state(state)
 
                         print(
                             "🚨 SIGNAL SENT",
+                            flush=True
+                        )
+
+                        print(
+                            f"{best['pair']} "
+                            f"{best['direction']} "
+                            f"{best['confidence']}%",
                             flush=True
                         )
 
@@ -1339,7 +1254,9 @@ def main():
                     flush=True
                 )
 
-            time.sleep(SCAN_INTERVAL)
+            time.sleep(
+                SCAN_INTERVAL
+            )
 
         except KeyboardInterrupt:
 
@@ -1368,3 +1285,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+                
