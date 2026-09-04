@@ -22,7 +22,9 @@ import numpy as np
 print("STEP 8: numpy loaded", flush=True)
 
 from datetime import datetime, timedelta, timezone
+print("STEP 9: Loading IQ Option API...", flush=True)
 from iqoptionapi.stable_api import IQ_Option
+print("STEP 10: IQ Option API loaded", flush=True)
 
 
 # ============================================================
