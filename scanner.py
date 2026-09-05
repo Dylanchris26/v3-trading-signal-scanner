@@ -87,7 +87,7 @@ SIGNAL_COOLDOWN_SECONDS = 20 * 60
 # Small delay between pair scans to reduce pressure on the API.
 PAIR_SCAN_DELAY_SECONDS = 0.35
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
