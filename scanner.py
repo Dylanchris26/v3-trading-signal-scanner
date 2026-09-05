@@ -79,7 +79,7 @@ MIN_SCORE = 68
 MIN_CONFIDENCE = 0.70
 MIN_ATR_RATIO = 0.00015
 MAX_ATR_RATIO = 0.012
-MAX_SIGNAL_AGE_SECONDS = 45
+MAX_SIGNAL_AGE_SECONDS = 180
 
 # Avoid repeated alerts for essentially the same setup during one run.
 SIGNAL_COOLDOWN_SECONDS = 20 * 60
