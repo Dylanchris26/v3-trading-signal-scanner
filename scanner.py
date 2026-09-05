@@ -75,8 +75,8 @@ CANDLE_COUNT = 220
 MIN_CANDLES = 130
 
 # Signal selectivity. A score is built from independent confirmations.
-MIN_SCORE = 78
-MIN_CONFIDENCE = 0.78
+MIN_SCORE = 68
+MIN_CONFIDENCE = 0.70
 MIN_ATR_RATIO = 0.00015
 MAX_ATR_RATIO = 0.012
 MAX_SIGNAL_AGE_SECONDS = 45
