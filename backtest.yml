@@ -1,0 +1,32 @@
+name: IQ Option Strategy Backtest
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install iqoptionapi requests; fi
+
+      - name: Run backtest
+        env:
+          IQ_EMAIL: ${{ secrets.IQ_EMAIL }}
+          IQ_PASSWORD: ${{ secrets.IQ_PASSWORD }}
+          BACKTEST_MINUTES: '2880'
+          BACKTEST_MAX_SIGNALS_PER_PAIR: '40'
+          BACKTEST_SIGNAL_GAP: '3'
+        run: python backtest.py
