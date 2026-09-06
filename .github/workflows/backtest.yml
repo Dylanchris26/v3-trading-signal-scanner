@@ -27,4 +27,4 @@ jobs:
         env:
           IQ_EMAIL: ${{ secrets.IQ_EMAIL }}
           IQ_PASSWORD: ${{ secrets.IQ_PASSWORD }}
-        run: python backtest.py
+        run: python backtest_v2.py
