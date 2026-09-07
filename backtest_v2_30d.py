@@ -17,7 +17,7 @@ import scanner_v2 as strategy
 
 PAIRS = strategy.REGULAR_PAIRS
 CANDLES_PER_REQUEST = 1000
-HISTORY_MINUTES = int(os.getenv("BACKTEST_MINUTES", "10080"))  # 7-day validation window
+HISTORY_MINUTES = int(os.getenv("BACKTEST_MINUTES", "43200"))  # 7-day validation window
 MAX_SIGNALS_PER_PAIR = int(os.getenv("BACKTEST_MAX_SIGNALS_PER_PAIR", "60"))
 MIN_GAP_MINUTES = int(os.getenv("BACKTEST_SIGNAL_GAP", "3"))
 END_OFFSET_MINUTES = int(os.getenv("BACKTEST_END_OFFSET_MINUTES", "10080"))  # finish 7 days before now
