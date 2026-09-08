@@ -1,0 +1,61 @@
+name: V1 Timeframe + Expiry Experiment
+
+on:
+  workflow_dispatch:
+
+jobs:
+  experiment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: 1M entry - 5m expiry
+            timeframe: 1M
+            expiry: 5
+          - name: 1M entry - 10m expiry
+            timeframe: 1M
+            expiry: 10
+          - name: 1M entry - 15m expiry
+            timeframe: 1M
+            expiry: 15
+          - name: 1M entry - 30m expiry
+            timeframe: 1M
+            expiry: 30
+          - name: 5M entry - 5m expiry
+            timeframe: 5M
+            expiry: 5
+          - name: 5M entry - 10m expiry
+            timeframe: 5M
+            expiry: 10
+          - name: 5M entry - 15m expiry
+            timeframe: 5M
+            expiry: 15
+          - name: 5M entry - 30m expiry
+            timeframe: 5M
+            expiry: 30
+    name: ${{ matrix.name }}
+    env:
+      IQ_EMAIL: ${{ secrets.IQ_EMAIL }}
+      IQ_PASSWORD: ${{ secrets.IQ_PASSWORD }}
+      ENTRY_TIMEFRAME: ${{ matrix.timeframe }}
+      EXPIRY_MINUTES: ${{ matrix.expiry }}
+      BACKTEST_MINUTES: "14400"
+      BACKTEST_END_OFFSET_MINUTES: "10080"
+      BACKTEST_MAX_SIGNALS_PER_PAIR: "150"
+      BACKTEST_SIGNAL_GAP: "3"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests websocket-client
+          pip install git+https://github.com/iqoptionapi/iqoptionapi.git
+      - name: Run experiment
+        run: |
+          echo "Running ${{ matrix.name }}"
+          python timeframe_expiry_experiment.py
