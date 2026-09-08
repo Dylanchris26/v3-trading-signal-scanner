@@ -1,0 +1,44 @@
+name: V3 30-Day Validation (3 x 10-Day)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Period A (7-17 days ago)
+            offset: 10080
+          - name: Period B (17-27 days ago)
+            offset: 24480
+          - name: Period C (27-37 days ago)
+            offset: 38880
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+          pip install git+https://github.com/iqoptionapi/iqoptionapi.git
+
+      - name: Run ${{ matrix.name }}
+        env:
+          IQ_EMAIL: ${{ secrets.IQ_EMAIL }}
+          IQ_PASSWORD: ${{ secrets.IQ_PASSWORD }}
+          BACKTEST_MINUTES: "14400"
+          BACKTEST_END_OFFSET_MINUTES: "${{ matrix.offset }}"
+        run: |
+          echo "Running ${{ matrix.name }}"
+          python backtest_v3.py
