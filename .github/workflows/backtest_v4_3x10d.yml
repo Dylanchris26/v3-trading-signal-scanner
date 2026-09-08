@@ -1,0 +1,44 @@
+name: V4 - 3x10 Day Backtest
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Period A (7-17 days ago)
+            offset: 10080
+          - name: Period B (17-27 days ago)
+            offset: 24480
+          - name: Period C (27-37 days ago)
+            offset: 38880
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install iqoptionapi requests
+
+      - name: Run ${{ matrix.name }}
+        env:
+          IQ_EMAIL: ${{ secrets.IQ_EMAIL }}
+          IQ_PASSWORD: ${{ secrets.IQ_PASSWORD }}
+          BACKTEST_MINUTES: 14400
+          BACKTEST_END_OFFSET_MINUTES: ${{ matrix.offset }}
+          BACKTEST_MAX_SIGNALS_PER_PAIR: 150
+        run: |
+          echo "Running ${{ matrix.name }}"
+          python backtest_v4.py
