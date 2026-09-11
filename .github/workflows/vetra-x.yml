@@ -1,0 +1,72 @@
+name: VETRA-X Learning Signal Scanner
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      IQ_EMAIL: ${{ secrets.IQ_EMAIL }}
+      IQ_PASSWORD: ${{ secrets.IQ_PASSWORD }}
+      TELEGRAM_TOKEN: ${{ secrets.BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.CHAT_ID }}
+      ACCOUNT_MODE: PRACTICE
+      MAX_DAILY_SIGNALS: '4'
+      PYTHONUNBUFFERED: '1'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-cache-dir             'git+https://github.com/iqoptionapi/iqoptionapi.git@8a903cc'             pandas numpy scikit-learn requests websocket-client
+
+      - name: Compile scanner
+        run: python -m py_compile scanner.py
+
+      - name: Confirm known Digital crash path is not used
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          source = Path("scanner.py").read_text(encoding="utf-8")
+          forbidden = [
+              "get_all_open_time(",
+              "get_digital_underlying_list_data(",
+          ]
+          found = [x for x in forbidden if x in source]
+          if found:
+              raise SystemExit("FAIL: scanner.py contains forbidden API call(s): " + ", ".join(found))
+          print("PASS: scanner.py does not call the known Digital crash path.")
+          PY
+
+      - name: Run VETRA-X learning scanner
+        run: python scanner.py
+
+      - name: Save learning brain
+        run: |
+          git config user.name "VETRA-X Bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add vetrax_learning_state.json
+          if git diff --cached --quiet; then
+            echo "No new learning data to save."
+          else
+            git commit -m "Update VETRA-X learning data"
+            git push
+          fi
