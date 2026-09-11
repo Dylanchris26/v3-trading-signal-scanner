@@ -1,1364 +1,371 @@
-"""
-IQ Option Practice/Demo Signal Scanner
-Single-file replacement for the V42 scanner.
+# VETRA-X LEARNING SIGNAL BOT — PRACTICE / SIGNAL ONLY
+# --------------------------------------------------------
+# This is a single-file research bot.
+# It learns from completed predictions over time.
+#
+# Required environment variables:
+# IQ_EMAIL, IQ_PASSWORD, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+#
+# Optional:
+# ACCOUNT_MODE=PRACTICE
+# MAX_DAILY_SIGNALS=4
+#
+# IMPORTANT:
+# - No automatic trading.
+# - The learning model starts only after it has enough completed examples.
+# - Until then, the bot uses a conservative VETRA-style market score.
+# - Do not treat the displayed confidence as a guaranteed win probability.
 
-- Practice/demo only
-- Auto-trading OFF
-- Maximum 4 signals/day
-- Regular pairs first; OTC fallback
-- 1M entry + 5M/15M trend confirmation
-- Telegram alerts
-- Detailed rejection diagnostics
-- Uses candle "to" timestamp when available so freshness is based on the
-  candle's close/update time rather than only its opening time.
-"""
-
-from __future__ import annotations
-
-import json
-import logging
-import os
-import statistics
-import time
-from dataclasses import asdict, dataclass
+import os, time, json, math
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-from zoneinfo import ZoneInfo
 
+import numpy as np
+import pandas as pd
 import requests
-from iqoptionapi.stable_api import IQ_Option
-import iqoptionapi.constants as OP_code
 
+# iqoptionapi is an unofficial community library.
+try:
+    from iqoptionapi.stable_api import IQ_Option
+except Exception as e:
+    raise SystemExit(f"iqoptionapi import failed: {e}")
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+try:
+    from sklearn.linear_model import SGDClassifier
+    from sklearn.preprocessing import StandardScaler
+except Exception as e:
+    raise SystemExit(f"scikit-learn import failed: {e}")
 
-ACCOUNT_MODE = "PRACTICE"
-AUTO_TRADE = False
+EMAIL = os.environ.get("IQ_EMAIL", "")
+PASSWORD = os.environ.get("IQ_PASSWORD", "")
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+MODE = os.environ.get("ACCOUNT_MODE", "PRACTICE").upper()
 
-MAX_DAILY_SIGNALS = 4
-STATE_FILE = Path(os.getenv("STATE_FILE", "v42_state.json"))
+MAX_DAILY_SIGNALS = int(os.environ.get("MAX_DAILY_SIGNALS", "4"))
+MIN_CONFIDENCE = float(os.environ.get("MIN_CONFIDENCE", "0.78"))
 
-NIGERIA_TZ = ZoneInfo("Africa/Lagos")
-
-IQ_EMAIL = os.getenv("IQ_EMAIL", "").strip()
-IQ_PASSWORD = os.getenv("IQ_PASSWORD", "").strip()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()
-
+# A deliberately limited pair list. OTC symbols are only considered when
+# fresh OTC candles are available; this file does NOT call get_all_open_time().
 REGULAR_PAIRS = [
-    "EURUSD",
-    "GBPUSD",
-    "USDJPY",
-    "USDCHF",
-    "AUDUSD",
-    "USDCAD",
-    "NZDUSD",
-    "EURGBP",
-    "EURJPY",
-    "GBPJPY",
-    "AUDJPY",
-    "CADJPY",
+    "EURUSD","GBPUSD","USDJPY","USDCHF","AUDUSD","USDCAD",
+    "NZDUSD","EURJPY","GBPJPY","EURGBP","EURCAD","AUDJPY"
+]
+OTC_PAIRS = [
+    "EURUSD-OTC","GBPUSD-OTC","USDJPY-OTC","USDCHF-OTC",
+    "AUDUSD-OTC","USDCAD-OTC","NZDUSD-OTC","EURJPY-OTC",
+    "GBPJPY-OTC","EURGBP-OTC","EURCAD-OTC","AUDJPY-OTC",
+    "GBPCHF-OTC","NZDJPY-OTC","NZDCAD-OTC"
 ]
 
-TIMEFRAMES = {
-    "1M": 60,
-    "5M": 300,
-    "15M": 900,
-}
+STATE_FILE = Path("vetrax_learning_state.json")
+MODEL_FILE = Path("vetrax_model.json")
+LOCK_FILE = Path("vetrax_signal_lock.json")
 
-CANDLE_COUNT = 220
-MIN_CANDLES = 130
+FEATURES = [
+    "ret1","ret2","ret3","ret5","body","range","upper_wick","lower_wick",
+    "ema9_gap","ema21_gap","ema50_gap","rsi","macd","macd_signal",
+    "atr_pct","trend5","momentum5","break_high","break_low",
+    "vol_ratio","hour_sin","hour_cos"
+]
 
-# Signal quality gates.
-MIN_SCORE = 68
-MIN_CONFIDENCE = 0.70
-
-# ATR must be neither dead nor excessively volatile.
-MIN_ATR_RATIO = 0.00015
-MAX_ATR_RATIO = 0.012
-
-# Latest candle may be up to 180 seconds old.
-MAX_SIGNAL_AGE_SECONDS = 180
-
-SIGNAL_COOLDOWN_SECONDS = 20 * 60
-PAIR_SCAN_DELAY_SECONDS = 0.35
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.DEBUG),
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-LOGGER = logging.getLogger("v42_scanner")
-
-
-# ============================================================
-# DATA MODELS
-# ============================================================
-
-@dataclass
-class Candle:
-    timestamp: int
-    open: float
-    close: float
-    high: float
-    low: float
-    volume: float = 0.0
-
-
-@dataclass
-class Signal:
-    pair: str
-    market_type: str
-    direction: str
-    expiry_minutes: int
-    score: int
-    confidence: float
-    entry_reference: float
-    rsi: float
-    bias_5m: str
-    bias_15m: str
-    reasons: List[str]
-    generated_at: str
-
-
-# ============================================================
-# STATE
-# ============================================================
-
-def nigeria_today() -> str:
-    return datetime.now(NIGERIA_TZ).date().isoformat()
-
-
-def load_state() -> Dict[str, Any]:
-    default = {
-        "date": nigeria_today(),
-        "signal_count": 0,
-        "signals": [],
-        "last_signal_epoch": 0.0,
-    }
-
+def load_json(path, default):
     try:
-        if not STATE_FILE.exists():
-            return default
-
-        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-
-        if not isinstance(state, dict):
-            return default
-
-        if state.get("date") != nigeria_today():
-            return default
-
-        state.setdefault("signals", [])
-        state.setdefault("last_signal_epoch", 0.0)
-
-        try:
-            state["signal_count"] = int(state.get("signal_count", 0))
-        except (TypeError, ValueError):
-            state["signal_count"] = 0
-
-        state["signal_count"] = max(
-            0, min(MAX_DAILY_SIGNALS, state["signal_count"])
-        )
-
-        return state
-
-    except (OSError, json.JSONDecodeError) as exc:
-        LOGGER.warning("Could not read state file: %s", exc)
+        return json.loads(path.read_text())
+    except Exception:
         return default
 
+def save_json(path, obj):
+    path.write_text(json.dumps(obj, indent=2))
 
-def save_state(state: Dict[str, Any]) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(
-        json.dumps(state, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    tmp.replace(STATE_FILE)
-
-
-def daily_limit_reached(state: Dict[str, Any]) -> bool:
-    return int(state.get("signal_count", 0)) >= MAX_DAILY_SIGNALS
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def telegram_send(text: str) -> bool:
-    if not BOT_TOKEN or not CHAT_ID:
-        LOGGER.error("BOT_TOKEN and CHAT_ID must be set.")
-        return False
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
+def tg(text):
+    if not TOKEN or not CHAT_ID:
+        print(text)
+        return
     try:
-        response = requests.post(
-            url,
-            json={
-                "chat_id": CHAT_ID,
-                "text": text,
-                "disable_web_page_preview": True,
-            },
-            timeout=20,
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text},
+            timeout=15,
         )
-        response.raise_for_status()
+    except Exception as e:
+        print("Telegram error:", e)
 
-        data = response.json()
-
-        if not data.get("ok", False):
-            LOGGER.error("Telegram rejected message: %s", data)
-            return False
-
-        return True
-
-    except requests.RequestException as exc:
-        LOGGER.error("Telegram send failed: %s", exc)
-        return False
-
-
-def format_signal(signal: Signal, count_after_send: int) -> str:
-    direction = "🟢 CALL" if signal.direction == "CALL" else "🔴 PUT"
-    reasons = "\n".join(f"• {x}" for x in signal.reasons)
-
-    return (
-        "📡 IQ OPTION PRACTICE SIGNAL\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"Pair: {signal.pair}\n"
-        f"Market: {signal.market_type}\n"
-        f"Direction: {direction}\n"
-        f"Expiry: {signal.expiry_minutes} min\n"
-        f"Score: {signal.score}/100\n"
-        f"Confidence: {signal.confidence * 100:.1f}%\n"
-        f"Entry: {signal.entry_reference:.6f}\n"
-        f"RSI: {signal.rsi:.1f}\n"
-        f"5M bias: {signal.bias_5m}\n"
-        f"15M bias: {signal.bias_15m}\n"
-        "\nReasons:\n"
-        f"{reasons}\n"
-        "\n⚠️ PRACTICE/DEMO ONLY\n"
-        "🤖 Auto-trading: OFF\n"
-        f"Daily signals: {count_after_send}/{MAX_DAILY_SIGNALS}\n"
-        "━━━━━━━━━━━━━━━━━━━━"
-    )
-
-
-# ============================================================
-# IQ OPTION
-# ============================================================
-
-def connect_iq() -> IQ_Option:
-    if not IQ_EMAIL or not IQ_PASSWORD:
-        raise RuntimeError(
-            "IQ_EMAIL and IQ_PASSWORD must be supplied as environment variables."
-        )
-
-    iq = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
-    connected, reason = iq.connect()
-
-    if not connected:
-        raise RuntimeError(f"IQ Option connection failed: {reason}")
-
-    iq.change_balance(ACCOUNT_MODE)
-
-    # IMPORTANT: do NOT call update_ACTIVES_OPCODE() here.
-    # That helper also requests crypto/forex/CFD instruments, and some
-    # iqoptionapi builds now receive an "Invalid contract" response there.
-    # We only need the binary/turbo initialization payload for OTC symbols.
+def connect():
+    if not EMAIL or not PASSWORD:
+        raise SystemExit("Missing IQ_EMAIL or IQ_PASSWORD.")
+    iq = IQ_Option(EMAIL, PASSWORD)
+    ok, reason = iq.connect()
+    if not ok:
+        raise SystemExit(f"IQ Option connection failed: {reason}")
     try:
-        init_data = iq.get_all_init_v2()
-        mapped = 0
-        if isinstance(init_data, dict):
-            for option_type in ("binary", "turbo"):
-                section = init_data.get(option_type, {})
-                actives = section.get("actives", {}) if isinstance(section, dict) else {}
-                if not isinstance(actives, dict):
-                    continue
-                for active_id, active in actives.items():
-                    if not isinstance(active, dict):
-                        continue
-                    raw_name = str(active.get("name", "")).strip()
-                    if not raw_name:
-                        continue
-                    name = raw_name.split(".")[-1].upper()
-                    try:
-                        OP_code.ACTIVES[name] = int(active_id)
-                        mapped += 1
-                    except (TypeError, ValueError):
-                        continue
-        LOGGER.info("IQ Option binary/turbo symbols refreshed: %s symbols.", mapped)
-    except Exception as exc:
-        LOGGER.warning("Could not refresh IQ Option binary/turbo symbols: %s", exc)
-
-    if AUTO_TRADE:
-        raise RuntimeError("AUTO_TRADE must remain False.")
-
-    LOGGER.info("Connected to IQ Option in %s mode.", ACCOUNT_MODE)
-
+        iq.change_balance(MODE)
+    except Exception:
+        pass
+    print("Connected to IQ Option in", MODE, "mode.")
     return iq
 
-
-def _iq_server_time(iq: IQ_Option) -> int:
-    """Return IQ Option server time when available."""
+def candles(iq, pair, n=120):
     try:
-        ts = getattr(getattr(iq, "timesync", None), "server_timestamp", None)
-        if ts is not None:
-            return int(float(ts))
-    except (TypeError, ValueError):
-        pass
-    return int(time.time())
-
-
-def _latest_candle_timestamp(raw: Any) -> Optional[int]:
-    if not raw:
-        return None
-    try:
-        item = raw[-1]
-        value = item.get("to", item.get("from"))
-        if value is None:
+        data = iq.get_candles(pair, 60, n, time.time())
+        if not data:
             return None
-        ts = int(float(value))
-        if ts > 10_000_000_000:
-            ts //= 1000
-        return ts
-    except (IndexError, AttributeError, TypeError, ValueError):
+        df = pd.DataFrame(data)
+        # API normally uses from/to/open/close/min/max/volume.
+        if "from" in df:
+            df["ts"] = pd.to_numeric(df["from"], errors="coerce")
+        elif "at" in df:
+            df["ts"] = pd.to_numeric(df["at"], errors="coerce")
+        else:
+            return None
+        df["open"] = pd.to_numeric(df["open"], errors="coerce")
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df["min"] = pd.to_numeric(df["min"], errors="coerce")
+        df["max"] = pd.to_numeric(df["max"], errors="coerce")
+        if "volume" not in df:
+            df["volume"] = 0
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+        df = df.dropna(subset=["ts","open","close","min","max"]).sort_values("ts")
+        return df
+    except Exception as e:
+        print(pair, "candle error:", e)
         return None
 
+def rsi(s, period=14):
+    d = s.diff()
+    up = d.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    down = (-d.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = up / down.replace(0, np.nan)
+    return (100 - 100/(1+rs)).fillna(50)
 
-_OTC_SYMBOL_CACHE: Dict[str, List[str]] = {}
+def ema(s, span):
+    return s.ewm(span=span, adjust=False).mean()
 
+def feature_row(df):
+    if df is None or len(df) < 60:
+        return None
+    c = df["close"]
+    o = df["open"]
+    hi = df["max"]
+    lo = df["min"]
+    rng = (hi-lo).replace(0, np.nan)
+    body = (c-o) / rng
+    atr = (hi-lo).rolling(14).mean()
+    e9, e21, e50 = ema(c,9), ema(c,21), ema(c,50)
+    macd = e9-e21
+    macds = ema(macd,9)
+    rr = rsi(c)
+    volmean = df["volume"].rolling(20).mean().replace(0,np.nan)
 
-def _discover_otc_symbols(iq: IQ_Option, regular_pair: str) -> List[str]:
-    """Discover exact OTC symbols from IQ Option's binary/turbo init data."""
-    regular = regular_pair.upper()
-    if regular in _OTC_SYMBOL_CACHE:
-        return list(_OTC_SYMBOL_CACHE[regular])
+    x = {
+        "ret1": c.pct_change(1).iloc[-1],
+        "ret2": c.pct_change(2).iloc[-1],
+        "ret3": c.pct_change(3).iloc[-1],
+        "ret5": c.pct_change(5).iloc[-1],
+        "body": body.iloc[-1],
+        "range": (rng/c).iloc[-1],
+        "upper_wick": ((hi-np.maximum(o,c))/rng).iloc[-1],
+        "lower_wick": ((np.minimum(o,c)-lo)/rng).iloc[-1],
+        "ema9_gap": (c.iloc[-1]/e9.iloc[-1])-1,
+        "ema21_gap": (c.iloc[-1]/e21.iloc[-1])-1,
+        "ema50_gap": (c.iloc[-1]/e50.iloc[-1])-1,
+        "rsi": (rr.iloc[-1]-50)/50,
+        "macd": macd.iloc[-1]/c.iloc[-1],
+        "macd_signal": macds.iloc[-1]/c.iloc[-1],
+        "atr_pct": atr.iloc[-1]/c.iloc[-1],
+        "trend5": (e9.iloc[-1]-e21.iloc[-1])/c.iloc[-1],
+        "momentum5": c.iloc[-1]/c.iloc[-6]-1,
+        "break_high": c.iloc[-1]/hi.iloc[-21:-1].max()-1,
+        "break_low": c.iloc[-1]/lo.iloc[-21:-1].min()-1,
+        "vol_ratio": (df["volume"].iloc[-1]/volmean.iloc[-1]) if volmean.iloc[-1] else 1,
+    }
+    dt = datetime.fromtimestamp(float(df["ts"].iloc[-1]), timezone.utc)
+    x["hour_sin"] = math.sin(2*math.pi*dt.hour/24)
+    x["hour_cos"] = math.cos(2*math.pi*dt.hour/24)
+    vals = np.array([x[k] for k in FEATURES], dtype=float)
+    vals = np.nan_to_num(vals, nan=0.0, posinf=0.0, neginf=0.0)
+    return vals
 
-    found: List[str] = []
-    try:
-        data = iq.get_all_init_v2()
-        if not isinstance(data, dict):
-            return found
+def vetra_score(df):
+    if df is None or len(df) < 60:
+        return None
+    c=df.close; o=df.open; hi=df["max"]; lo=df["min"]
+    e9,e21,e50=ema(c,9),ema(c,21),ema(c,50)
+    rr=rsi(c).iloc[-1]
+    last=c.iloc[-1]; prev=c.iloc[-2]
+    score_buy=0; score_sell=0
 
-        for option_type in ("binary", "turbo"):
-            section = data.get(option_type, {})
-            actives = section.get("actives", {}) if isinstance(section, dict) else {}
-            if not isinstance(actives, dict):
-                continue
+    if e9.iloc[-1] > e21.iloc[-1] > e50.iloc[-1]: score_buy += 25
+    if e9.iloc[-1] < e21.iloc[-1] < e50.iloc[-1]: score_sell += 25
+    if last > e9.iloc[-1]: score_buy += 10
+    if last < e9.iloc[-1]: score_sell += 10
+    if rr > 52 and rr < 72: score_buy += 12
+    if rr < 48 and rr > 28: score_sell += 12
+    if c.iloc[-1] > o.iloc[-1]: score_buy += 12
+    if c.iloc[-1] < o.iloc[-1]: score_sell += 12
+    if c.iloc[-1] > prev: score_buy += 10
+    if c.iloc[-1] < prev: score_sell += 10
 
-            for active_id, active in actives.items():
-                if not isinstance(active, dict):
-                    continue
-                raw_name = str(active.get("name", "")).strip()
-                if not raw_name:
-                    continue
-                name = raw_name.split(".")[-1].upper()
+    recent_hi=hi.iloc[-21:-1].max()
+    recent_lo=lo.iloc[-21:-1].min()
+    if last > recent_hi: score_buy += 8
+    if last < recent_lo: score_sell += 8
 
-                # Keep the live IQ Option name -> active-id mapping in sync
-                # without touching crypto/forex/CFD instrument endpoints.
-                try:
-                    OP_code.ACTIVES[name] = int(active_id)
-                except (TypeError, ValueError):
-                    pass
+    direction="BUY" if score_buy>score_sell else "SELL"
+    raw=max(score_buy,score_sell)/87
+    return direction, min(.97, max(.50, raw)), score_buy, score_sell
 
-                if name == f"{regular}-OTC" and name not in found:
-                    found.append(name)
-    except Exception as exc:
-        LOGGER.debug("Could not discover OTC assets for %s: %s", regular_pair, exc)
+def state():
+    return load_json(STATE_FILE, {"examples":[],"signals":[],"day":"","count":0})
 
-    _OTC_SYMBOL_CACHE[regular] = list(found)
-    return found
+def model_predict(st, x):
+    # Lightweight online ML. Model parameters are stored as plain JSON so the
+    # learner can survive without a binary model file.
+    ex=st["examples"]
+    if len(ex) < 40:
+        return None
+    X=np.array([e["x"] for e in ex],dtype=float)
+    y=np.array([e["y"] for e in ex],dtype=int)
+    if len(set(y.tolist())) < 2:
+        return None
+    scaler=StandardScaler()
+    Xs=scaler.fit_transform(X)
+    clf=SGDClassifier(loss="log_loss", alpha=0.001, max_iter=1500,
+                      random_state=42, class_weight="balanced")
+    clf.fit(Xs,y)
+    p=float(clf.predict_proba(scaler.transform([x]))[0,1])
+    return p
 
-
-def market_status(
-    iq: IQ_Option,
-    regular_pair: str,
-) -> Tuple[Optional[str], Optional[str]]:
-    """Choose a live regular pair, otherwise the exact live OTC symbol."""
-    regular = regular_pair.upper()
-    server_now = _iq_server_time(iq)
-    freshness_limit = max(TIMEFRAMES["1M"] * 2, MAX_SIGNAL_AGE_SECONDS)
-
-    candidates: List[Tuple[str, str]] = [(regular, "REGULAR")]
-    discovered = _discover_otc_symbols(iq, regular)
-    candidates.extend((symbol, "OTC") for symbol in discovered)
-
-    # Compatibility fallbacks for older API builds.
-    for symbol in (
-        f"{regular}-OTC",
-        f"{regular}OTC",
-        f"{regular}.OTC",
-        f"{regular}_OTC",
-    ):
-        if not any(existing == symbol for existing, _ in candidates):
-            candidates.append((symbol, "OTC"))
-
-    for symbol, market_type in candidates:
+def learn_from_old(st, iq):
+    # Resolve predictions once their 1-minute horizon has passed.
+    changed=False
+    for s in st["signals"]:
+        if s.get("resolved"): continue
+        if time.time() < s["resolve_at"]: continue
         try:
-            raw = iq.get_candles(symbol, 60, 3, server_now)
-            latest = _latest_candle_timestamp(raw)
-            if latest is None or not raw or len(raw) < 2:
-                LOGGER.debug("MARKET CHECK %s (%s): no usable candles.", symbol, market_type)
-                continue
-            age = max(0, server_now - latest)
-            if age <= freshness_limit:
-                LOGGER.info(
-                    "MARKET CHECK %s -> %s (%s): LIVE (age=%ss).",
-                    regular_pair, symbol, market_type, age,
-                )
-                return symbol, market_type
-            LOGGER.debug(
-                "MARKET CHECK %s (%s): stale (age=%ss); trying next market.",
-                symbol, market_type, age,
-            )
-        except Exception as exc:
-            LOGGER.debug("Market check failed for %s: %s", symbol, exc)
-
-    LOGGER.warning("MARKET CHECK %s: no LIVE regular or OTC market found.", regular_pair)
-    return None, None
-
-
-# ============================================================
-# CANDLE DATA
-# ============================================================
-
-def get_candles(
-    iq: IQ_Option,
-    symbol: str,
-    timeframe: str,
-    count: int,
-) -> List[Candle]:
-
-    seconds = TIMEFRAMES[timeframe]
-    end = _iq_server_time(iq)
-
-    try:
-        raw = iq.get_candles(symbol, seconds, count, end)
-    except Exception as exc:
-        LOGGER.debug(
-            "%s %s candle request failed: %s",
-            symbol,
-            timeframe,
-            exc,
-        )
-        return []
-
-    if not raw:
-        return []
-
-    candles: List[Candle] = []
-
-    for item in raw:
-        try:
-            # IQ Option candle data normally has both "from" and "to".
-            # "to" is preferable for freshness because it represents the
-            # candle's close/update time.
-            raw_timestamp = item.get("to", item.get("from"))
-
-            if raw_timestamp is None:
-                continue
-
-            timestamp = int(float(raw_timestamp))
-
-            # Defensive support for millisecond timestamps.
-            if timestamp > 10_000_000_000:
-                timestamp //= 1000
-
-            candles.append(
-                Candle(
-                    timestamp=timestamp,
-                    open=float(item["open"]),
-                    close=float(item["close"]),
-                    high=float(item["max"]),
-                    low=float(item["min"]),
-                    volume=float(item.get("volume", 0.0)),
-                )
-            )
-
-        except (KeyError, TypeError, ValueError):
-            continue
-
-    candles.sort(key=lambda c: c.timestamp)
-
-    if candles:
-        age = _iq_server_time(iq) - candles[-1].timestamp
-        LOGGER.debug(
-            "%s %s candles: count=%d latest_timestamp=%d age=%ds",
-            symbol,
-            timeframe,
-            len(candles),
-            candles[-1].timestamp,
-            age,
-        )
-
-    return candles
-
-
-def candles_are_fresh(
-    candles: Sequence[Candle],
-    timeframe_seconds: int,
-) -> bool:
-
-    if not candles:
-        return False
-
-    age = int(time.time()) - int(candles[-1].timestamp)
-
-    # Never reject a future timestamp caused by feed timing.
-    if age < 0:
-        return True
-
-    allowed = max(timeframe_seconds * 2, MAX_SIGNAL_AGE_SECONDS)
-
-    return age <= allowed
-
-
-# ============================================================
-# INDICATORS
-# ============================================================
-
-def ema(values: Sequence[float], period: int) -> List[float]:
-    if len(values) < period:
-        return []
-
-    multiplier = 2.0 / (period + 1.0)
-    result = [statistics.fmean(values[:period])]
-
-    for value in values[period:]:
-        result.append(
-            (value - result[-1]) * multiplier + result[-1]
-        )
-
-    return result
-
-
-def ema_last(
-    values: Sequence[float],
-    period: int,
-) -> Optional[float]:
-
-    if len(values) < period:
-        return None
-
-    result = ema(values, period)
-    return result[-1] if result else None
-
-
-def rsi(
-    values: Sequence[float],
-    period: int = 14,
-) -> Optional[float]:
-
-    if len(values) < period + 1:
-        return None
-
-    gains = []
-    losses = []
-
-    for i in range(1, period + 1):
-        change = values[i] - values[i - 1]
-        gains.append(max(change, 0.0))
-        losses.append(max(-change, 0.0))
-
-    avg_gain = statistics.fmean(gains)
-    avg_loss = statistics.fmean(losses)
-
-    for i in range(period + 1, len(values)):
-        change = values[i] - values[i - 1]
-
-        gain = max(change, 0.0)
-        loss = max(-change, 0.0)
-
-        avg_gain = ((avg_gain * (period - 1)) + gain) / period
-        avg_loss = ((avg_loss * (period - 1)) + loss) / period
-
-    if avg_loss == 0:
-        return 100.0
-
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
-
-
-def macd(
-    values: Sequence[float],
-) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-
-    if len(values) < 35:
-        return None, None, None
-
-    fast = ema(values, 12)
-    slow = ema(values, 26)
-
-    if not fast or not slow:
-        return None, None, None
-
-    offset = len(fast) - len(slow)
-    macd_line = [
-        fast[offset + i] - slow[i]
-        for i in range(len(slow))
-    ]
-
-    signal_line = ema(macd_line, 9)
-
-    if not signal_line:
-        return None, None, None
-
-    current = macd_line[-1]
-    signal = signal_line[-1]
-
-    return current, signal, current - signal
-
-
-def atr(
-    candles: Sequence[Candle],
-    period: int = 14,
-) -> Optional[float]:
-
-    if len(candles) < period + 1:
-        return None
-
-    ranges = []
-
-    for i in range(1, len(candles)):
-        current = candles[i]
-        previous = candles[i - 1]
-
-        ranges.append(
-            max(
-                current.high - current.low,
-                abs(current.high - previous.close),
-                abs(current.low - previous.close),
-            )
-        )
-
-    if len(ranges) < period:
-        return None
-
-    return statistics.fmean(ranges[-period:])
-
-
-def candle_momentum(candles: Sequence[Candle]) -> float:
-    if len(candles) < 4:
-        return 0.0
-
-    sample = candles[-3:]
-    weighted = 0.0
-    total_weight = 0.0
-
-    for weight, candle in enumerate(sample, start=1):
-        body = candle.close - candle.open
-        rng = max(candle.high - candle.low, 1e-12)
-
-        weighted += (body / rng) * weight
-        total_weight += weight
-
-    return weighted / total_weight
-
-
-# ============================================================
-# STRATEGY
-# ============================================================
-
-def bias_from_trend(
-    closes: Sequence[float],
-    fast_period: int = 20,
-    mid_period: int = 50,
-    slow_period: int = 100,
-) -> str:
-
-    fast = ema_last(closes, fast_period)
-    mid = ema_last(closes, mid_period)
-    slow = ema_last(closes, slow_period)
-
-    if None in (fast, mid, slow):
-        return "NEUTRAL"
-
-    if fast > mid > slow:
-        return "BULLISH"
-
-    if fast < mid < slow:
-        return "BEARISH"
-
-    return "NEUTRAL"
-
-
-def entry_structure(
-    candles: Sequence[Candle],
-) -> Tuple[str, List[str]]:
-
-    closes = [c.close for c in candles]
-
-    e9 = ema(closes, 9)
-    e21 = ema(closes, 21)
-    e50 = ema(closes, 50)
-
-    if not e9 or not e21 or not e50:
-        return "NEUTRAL", []
-
-    latest9 = e9[-1]
-    latest21 = e21[-1]
-    latest50 = e50[-1]
-
-    reasons: List[str] = []
-
-    if latest9 > latest21 > latest50:
-        reasons.append("1M EMA 9/21/50 is bullish.")
-        return "BULLISH", reasons
-
-    if latest9 < latest21 < latest50:
-        reasons.append("1M EMA 9/21/50 is bearish.")
-        return "BEARISH", reasons
-
-    return "NEUTRAL", reasons
-
-
-def two_candle_confirmation(
-    candles: Sequence[Candle],
-    direction: str,
-) -> bool:
-
-    if len(candles) < 3:
-        return False
-
-    a = candles[-2]
-    b = candles[-1]
-
-    a_body = abs(a.close - a.open)
-    b_body = abs(b.close - b.open)
-
-    a_range = max(a.high - a.low, 1e-12)
-    b_range = max(b.high - b.low, 1e-12)
-
-    if direction == "CALL":
-        return (
-            a.close > a.open
-            and b.close > b.open
-            and b.close > a.close
-            and (b_body / b_range) >= 0.50
-            and (a_body / a_range) >= 0.35
-        )
-
-    return (
-        a.close < a.open
-        and b.close < b.open
-        and b.close < a.close
-        and (b_body / b_range) >= 0.50
-        and (a_body / a_range) >= 0.35
-    )
-
-
-def macd_confirmation(
-    values: Sequence[float],
-    direction: str,
-) -> bool:
-
-    current, signal, histogram = macd(values)
-
-    if current is None or signal is None or histogram is None:
-        return False
-
-    if direction == "CALL":
-        return current > signal and histogram > 0
-
-    return current < signal and histogram < 0
-
-
-def support_resistance(
-    candles: Sequence[Candle],
-    lookback: int = 40,
-) -> Tuple[float, float]:
-
-    sample = candles[-lookback:]
-
-    return (
-        min(c.low for c in sample),
-        max(c.high for c in sample),
-    )
-
-
-def near_support_resistance(
-    candles: Sequence[Candle],
-    direction: str,
-    atr_value: float,
-) -> Tuple[bool, str]:
-
-    support, resistance = support_resistance(candles)
-    price = candles[-1].close
-
-    proximity = max(
-        atr_value * 0.90,
-        price * 0.0005,
-    )
-
-    if direction == "CALL":
-        if abs(price - support) <= proximity:
-            return True, "Price is reacting near support."
-
-        if price > resistance:
-            return True, "Price broke above resistance."
-
-    else:
-        if abs(price - resistance) <= proximity:
-            return True, "Price is reacting near resistance."
-
-        if price < support:
-            return True, "Price broke below support."
-
-    return False, ""
-
-
-def volatility_ok(
-    candles: Sequence[Candle],
-    atr_value: float,
-) -> bool:
-
-    price = candles[-1].close
-    ratio = atr_value / max(price, 1e-12)
-
-    return MIN_ATR_RATIO <= ratio <= MAX_ATR_RATIO
-
-
-def confidence_from_score(
-    score: int,
-    confirmations: int,
-    conflicts: int,
-) -> float:
-
-    value = 0.50 + (score / 100.0) * 0.40
-    value += min(confirmations, 4) * 0.025
-    value -= min(conflicts, 3) * 0.035
-
-    return max(0.0, min(0.99, value))
-
-
-def choose_expiry(
-    candles: Sequence[Candle],
-    atr_value: float,
-    score: int,
-) -> int:
-
-    price = candles[-1].close
-    atr_ratio = atr_value / max(price, 1e-12)
-    momentum = abs(candle_momentum(candles))
-
-    if score >= 90 and momentum >= 0.48:
-        return 3
-
-    if score >= 84 and momentum >= 0.30:
-        return 5
-
-    return 10
-
-
-# ============================================================
-# CORE ANALYSIS
-# ============================================================
-
-def analyze_symbol(
-    iq: IQ_Option,
-    symbol: str,
-    market_type: str,
-) -> Optional[Signal]:
-
-    candles_1m = get_candles(iq, symbol, "1M", CANDLE_COUNT)
-    candles_5m = get_candles(iq, symbol, "5M", CANDLE_COUNT)
-    candles_15m = get_candles(iq, symbol, "15M", CANDLE_COUNT)
-
-    if any(
-        len(c) < MIN_CANDLES
-        for c in (candles_1m, candles_5m, candles_15m)
-    ):
-        LOGGER.debug("%s: rejected - insufficient candles.", symbol)
-        return None
-
-    # Freshness is now based on the candle "to" timestamp.
-    for label, candles, seconds in (
-        ("1M", candles_1m, TIMEFRAMES["1M"]),
-        ("5M", candles_5m, TIMEFRAMES["5M"]),
-        ("15M", candles_15m, TIMEFRAMES["15M"]),
-    ):
-        age = _iq_server_time(iq) - candles[-1].timestamp
-
-        if not candles_are_fresh(candles, seconds):
-            LOGGER.debug(
-                "%s: rejected - %s candles stale (age=%ss).",
-                symbol,
-                label,
-                age,
-            )
-            return None
-
-    closes_1m = [c.close for c in candles_1m]
-    closes_5m = [c.close for c in candles_5m]
-    closes_15m = [c.close for c in candles_15m]
-
-    bias_5m = bias_from_trend(closes_5m)
-    bias_15m = bias_from_trend(closes_15m)
-
-    entry_bias, entry_reasons = entry_structure(candles_1m)
-
-    if entry_bias == "NEUTRAL":
-        LOGGER.debug(
-            "%s: rejected - 1M entry structure is NEUTRAL.",
-            symbol,
-        )
-        return None
-
-    direction = "CALL" if entry_bias == "BULLISH" else "PUT"
-
-    if direction == "CALL":
-        if bias_5m != "BULLISH" or bias_15m != "BULLISH":
-            LOGGER.debug(
-                "%s: rejected - CALL needs bullish 5M+15M; got 5M=%s 15M=%s.",
-                symbol,
-                bias_5m,
-                bias_15m,
-            )
-            return None
-    else:
-        if bias_5m != "BEARISH" or bias_15m != "BEARISH":
-            LOGGER.debug(
-                "%s: rejected - PUT needs bearish 5M+15M; got 5M=%s 15M=%s.",
-                symbol,
-                bias_5m,
-                bias_15m,
-            )
-            return None
-
-    rsi_value = rsi(closes_1m, 14)
-    atr_value = atr(candles_1m, 14)
-
-    if rsi_value is None or atr_value is None:
-        LOGGER.debug("%s: rejected - RSI/ATR unavailable.", symbol)
-        return None
-
-    if not volatility_ok(candles_1m, atr_value):
-        LOGGER.debug(
-            "%s: rejected - ATR volatility outside range; ATR=%s price=%s.",
-            symbol,
-            atr_value,
-            candles_1m[-1].close,
-        )
-        return None
-
-    if direction == "CALL" and not (50.0 <= rsi_value <= 72.0):
-        LOGGER.debug(
-            "%s: rejected - CALL RSI %.2f outside 50-72.",
-            symbol,
-            rsi_value,
-        )
-        return None
-
-    if direction == "PUT" and not (28.0 <= rsi_value <= 50.0):
-        LOGGER.debug(
-            "%s: rejected - PUT RSI %.2f outside 28-50.",
-            symbol,
-            rsi_value,
-        )
-        return None
-
-    score = 36
-    confirmations = 2
-    conflicts = 0
-
-    reasons = list(entry_reasons)
-
-    # RSI.
-    if direction == "CALL":
-        if 54 <= rsi_value <= 67:
-            score += 10
-            confirmations += 1
-            reasons.append("RSI supports bullish continuation.")
-        elif 50 <= rsi_value < 54:
-            score += 5
-        else:
-            conflicts += 1
-    else:
-        if 33 <= rsi_value <= 46:
-            score += 10
-            confirmations += 1
-            reasons.append("RSI supports bearish continuation.")
-        elif 46 < rsi_value <= 50:
-            score += 5
-        else:
-            conflicts += 1
-
-    # MACD.
-    if macd_confirmation(closes_1m, direction):
-        score += 12
-        confirmations += 1
-        reasons.append("MACD confirms direction.")
-    else:
-        conflicts += 1
-
-    # ATR.
-    score += 8
-    confirmations += 1
-    reasons.append("ATR volatility is usable.")
-
-    # Momentum.
-    if (
-        candle_momentum(candles_1m) >= 0.22
-        if direction == "CALL"
-        else candle_momentum(candles_1m) <= -0.22
-    ):
-        score += 10
-        confirmations += 1
-        reasons.append("1M candle momentum confirms direction.")
-    else:
-        conflicts += 1
-
-    # Two-candle continuation.
-    if two_candle_confirmation(candles_1m, direction):
-        score += 14
-        confirmations += 1
-        reasons.append("Two-candle continuation is confirmed.")
-    else:
-        conflicts += 1
-
-    # Support/resistance.
-    sr_ok, sr_reason = near_support_resistance(
-        candles_1m,
-        direction,
-        atr_value,
-    )
-
-    if sr_ok:
-        score += 10
-        confirmations += 1
-        reasons.append(sr_reason)
-    else:
-        score += 2
-
-    # Higher-timeframe candle momentum.
-    momentum_5m = candle_momentum(candles_5m)
-    momentum_15m = candle_momentum(candles_15m)
-
-    if direction == "CALL":
-        if momentum_5m > -0.15 and momentum_15m > -0.15:
-            score += 5
-            confirmations += 1
-            reasons.append("5M/15M momentum does not contradict CALL.")
-        else:
-            conflicts += 1
-    else:
-        if momentum_5m < 0.15 and momentum_15m < 0.15:
-            score += 5
-            confirmations += 1
-            reasons.append("5M/15M momentum does not contradict PUT.")
-        else:
-            conflicts += 1
-
-    score = max(0, min(100, int(round(score))))
-    confidence = confidence_from_score(
-        score,
-        confirmations,
-        conflicts,
-    )
-
-    LOGGER.debug(
-        "%s: CANDIDATE direction=%s score=%d confidence=%.2f "
-        "confirmations=%d conflicts=%d RSI=%.2f 5M=%s 15M=%s",
-        symbol,
-        direction,
-        score,
-        confidence,
-        confirmations,
-        conflicts,
-        rsi_value,
-        bias_5m,
-        bias_15m,
-    )
-
-    if score < MIN_SCORE or confidence < MIN_CONFIDENCE:
-        LOGGER.debug(
-            "%s: rejected - score/confidence below threshold.",
-            symbol,
-        )
-        return None
-
-    age = int(time.time()) - candles_1m[-1].timestamp
-
-    if age > MAX_SIGNAL_AGE_SECONDS:
-        LOGGER.debug(
-            "%s: rejected - final 1M candle age=%ss > %ss.",
-            symbol,
-            age,
-            MAX_SIGNAL_AGE_SECONDS,
-        )
-        return None
-
-    expiry = choose_expiry(
-        candles_1m,
-        atr_value,
-        score,
-    )
-
-    return Signal(
-        pair=symbol,
-        market_type=market_type,
-        direction=direction,
-        expiry_minutes=expiry,
-        score=score,
-        confidence=confidence,
-        entry_reference=candles_1m[-1].close,
-        rsi=rsi_value,
-        bias_5m=bias_5m,
-        bias_15m=bias_15m,
-        reasons=reasons[:8],
-        generated_at=datetime.now(timezone.utc).isoformat(),
-    )
-
-
-# ============================================================
-# SIGNAL SELECTION
-# ============================================================
-
-def select_best_signal(
-    iq: IQ_Option,
-    state: Dict[str, Any],
-) -> Optional[Signal]:
-
-    if daily_limit_reached(state):
-        LOGGER.info(
-            "Daily limit reached: %s/%s.",
-            state["signal_count"],
-            MAX_DAILY_SIGNALS,
-        )
-        return None
-
-    candidates: List[Signal] = []
-
-    for regular_pair in REGULAR_PAIRS:
-
-        actual_symbol, market_type = market_status(
-            iq,
-            regular_pair,
-        )
-
-        if actual_symbol is None:
-            LOGGER.debug(
-                "%s unavailable; skipping.",
-                regular_pair,
-            )
-            continue
-
-        LOGGER.debug(
-            "%s -> %s (%s) available.",
-            regular_pair,
-            actual_symbol,
-            market_type,
-        )
-
-        try:
-            signal = analyze_symbol(
-                iq,
-                actual_symbol,
-                market_type,
-            )
-
-            if signal is not None:
-                candidates.append(signal)
-
-        except Exception as exc:
-            LOGGER.exception(
-                "Analysis failed for %s: %s",
-                actual_symbol,
-                exc,
-            )
-
-        time.sleep(PAIR_SCAN_DELAY_SECONDS)
+            df=candles(iq,s["pair"],8)
+            if df is None: continue
+            entry=float(s["entry_price"])
+            last=float(df.close.iloc[-1])
+            if s["direction"]=="BUY":
+                y=1 if last>entry else 0
+            else:
+                y=1 if last<entry else 0
+            st["examples"].append({"x":s["x"],"y":y,"pair":s["pair"],
+                                   "time":s["time"]})
+            s["resolved"]=True
+            s["result"]="WIN" if y else "LOSS"
+            changed=True
+        except Exception as e:
+            print("learning resolution:",e)
+    if changed:
+        st["examples"]=st["examples"][-2000:]
+        save_json(STATE_FILE,st)
+
+def fresh_enough(df):
+    if df is None or len(df)<2: return False
+    ts=float(df.ts.iloc[-1])
+    # Require a candle from roughly the last 3 minutes. This is a data-freshness
+    # check, not a claim that the broker's trading session is open.
+    return (time.time()-ts) <= 180
+
+def already_sent(st,pair):
+    now=time.time()
+    return any((s["pair"]==pair and now-s["created_at"]<300) for s in st["signals"])
+
+def main():
+    if MODE!="PRACTICE":
+        raise SystemExit("Safety lock: ACCOUNT_MODE must be PRACTICE.")
+
+    st=state()
+    today=datetime.now().strftime("%Y-%m-%d")
+    if st.get("day")!=today:
+        st["day"]=today; st["count"]=0
+        st["signals"]=[]
+        save_json(STATE_FILE,st)
+
+    iq=connect()
+    learn_from_old(st,iq)
+
+    # Scan regular first. OTC is a fallback only if regular data is not fresh.
+    candidates=[]
+    for pair in REGULAR_PAIRS:
+        df=candles(iq,pair)
+        if fresh_enough(df):
+            candidates.append(("REGULAR",pair,df))
 
     if not candidates:
-        return None
+        for pair in OTC_PAIRS:
+            df=candles(iq,pair)
+            if fresh_enough(df):
+                candidates.append(("OTC",pair,df))
 
-    candidates.sort(
-        key=lambda s: (
-            s.score,
-            s.confidence,
-            1 if s.market_type == "REGULAR" else 0,
-        ),
-        reverse=True,
-    )
-
-    best = candidates[0]
-
-    now = time.time()
-    last_signal = float(
-        state.get("last_signal_epoch", 0.0)
-    )
-
-    if now - last_signal < SIGNAL_COOLDOWN_SECONDS:
-        LOGGER.info(
-            "Signal cooldown active; no new signal sent."
-        )
-        return None
-
-    LOGGER.info(
-        "BEST SIGNAL: %s %s %s | score=%s confidence=%.2f",
-        best.pair,
-        best.market_type,
-        best.direction,
-        best.score,
-        best.confidence,
-    )
-
-    return best
-
-
-# ============================================================
-# VALIDATION / RECORDING
-# ============================================================
-
-def validate_environment() -> None:
-    missing = [
-        name
-        for name, value in {
-            "IQ_EMAIL": IQ_EMAIL,
-            "IQ_PASSWORD": IQ_PASSWORD,
-            "BOT_TOKEN": BOT_TOKEN,
-            "CHAT_ID": CHAT_ID,
-        }.items()
-        if not value
-    ]
-
-    if missing:
-        raise RuntimeError(
-            "Missing required environment variables: "
-            + ", ".join(missing)
-        )
-
-    if ACCOUNT_MODE != "PRACTICE":
-        raise RuntimeError(
-            "ACCOUNT_MODE must be PRACTICE."
-        )
-
-    if AUTO_TRADE:
-        raise RuntimeError(
-            "AUTO_TRADE must be False."
-        )
-
-
-def record_sent_signal(
-    state: Dict[str, Any],
-    signal: Signal,
-) -> None:
-
-    new_count = int(state.get("signal_count", 0)) + 1
-
-    if new_count > MAX_DAILY_SIGNALS:
-        raise RuntimeError(
-            "Safety check blocked a fifth daily signal."
-        )
-
-    state["date"] = nigeria_today()
-    state["signal_count"] = new_count
-    state["last_signal_epoch"] = time.time()
-
-    state.setdefault("signals", []).append(
-        {
-            **asdict(signal),
-            "sent_at": datetime.now(
-                timezone.utc
-            ).isoformat(),
-        }
-    )
-
-    state["signals"] = state["signals"][-20:]
-
-    save_state(state)
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main() -> None:
-
-    validate_environment()
-
-    state = load_state()
-
-    if daily_limit_reached(state):
-        LOGGER.info(
-            "Daily limit already reached: %s/%s.",
-            state["signal_count"],
-            MAX_DAILY_SIGNALS,
-        )
+    if not candidates:
+        print("No fresh market data. No signal.")
         return
 
-    iq: Optional[IQ_Option] = None
+    if st["count"]>=MAX_DAILY_SIGNALS:
+        print("Daily signal limit reached.")
+        return
 
-    try:
-        iq = connect_iq()
+    ranked=[]
+    for market,pair,df in candidates:
+        sc=vetra_score(df)
+        x=feature_row(df)
+        if sc and x is not None:
+            direction,rule_conf,buy,sell=sc
+            ml=model_predict(st,x)
+            if ml is None:
+                final=rule_conf
+                ml_text="learning warm-up"
+            else:
+                ml_dir="BUY" if ml>=.5 else "SELL"
+                ml_conf=max(ml,1-ml)
+                # Require agreement between the market score and ML.
+                if ml_dir != direction:
+                    continue
+                final=.55*rule_conf+.45*ml_conf
+                ml_text=f"ML {ml_conf*100:.1f}%"
+            ranked.append((final,market,pair,df,x,direction,rule_conf,ml_text))
 
-        # Connection test.
-        telegram_send(
-            "✅ TEST: IQ Option scanner connected successfully."
-        )
+    if not ranked:
+        print("No setup where the model and market score agree.")
+        return
 
-        signal = select_best_signal(
-            iq,
-            state,
-        )
+    ranked.sort(reverse=True,key=lambda z:z[0])
+    final,market,pair,df,x,direction,rule_conf,ml_text=ranked[0]
 
-        if signal is None:
-            LOGGER.info(
-                "No qualifying high-confidence setup found."
-            )
-            return
+    if final < MIN_CONFIDENCE or already_sent(st,pair):
+        print("Best setup below threshold:",pair,final)
+        return
 
-        state = load_state()
+    entry=float(df.close.iloc[-1])
+    now=datetime.now()
+    signal_time=now.strftime("%I:%M %p").lstrip("0")
+    signal={
+        "pair":pair,"market":market,"direction":direction,
+        "confidence":final,"entry_price":entry,"x":x.tolist(),
+        "created_at":time.time(),"resolve_at":time.time()+70,
+        "time":signal_time,"resolved":False
+    }
+    st["signals"].append(signal)
+    st["signals"]=st["signals"][-100:]
+    st["count"]+=1
+    save_json(STATE_FILE,st)
 
-        if daily_limit_reached(state):
-            LOGGER.warning(
-                "Daily limit reached during final safety check."
-            )
-            return
+    msg=(
+        "🧠 VETRA-X LEARNING SIGNAL\n\n"
+        f"PAIR: {pair} {'(OTC)' if market=='OTC' else '(REGULAR)'}\n"
+        "EXPIRY: 1 MIN\n"
+        f"CONFIDENCE: {final*100:.1f}%\n"
+        f"ENTRY: {signal_time}\n"
+        f"DIRECTION: {'🟢 BUY' if direction=='BUY' else '🔴 SELL'}\n\n"
+        f"MODEL: {ml_text}\n"
+        f"TODAY: {st['count']}/{MAX_DAILY_SIGNALS}\n"
+        "PRACTICE / SIGNAL ONLY"
+    )
+    tg(msg)
+    print(msg)
 
-        message = format_signal(
-            signal,
-            int(state.get("signal_count", 0)) + 1,
-        )
-
-        if telegram_send(message):
-            record_sent_signal(
-                state,
-                signal,
-            )
-
-            LOGGER.info(
-                "Signal sent: %s %s %s | %s/%s.",
-                signal.pair,
-                signal.market_type,
-                signal.direction,
-                state["signal_count"],
-                MAX_DAILY_SIGNALS,
-            )
-        else:
-            LOGGER.error(
-                "Signal was not recorded because Telegram failed."
-            )
-
-    except Exception as exc:
-        LOGGER.exception(
-            "Scanner failed: %s",
-            exc,
-        )
-        raise
-
-    finally:
-        if iq is not None:
-            try:
-                iq.close()
-            except Exception:
-                pass
-
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
